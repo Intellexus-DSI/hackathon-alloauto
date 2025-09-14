@@ -161,7 +161,7 @@ def main():
 
     # corpus_dir = "/home/mike/data/zozerta/derge_tshad_split_corpus/train"
     # output_dir = "/home/mike/data/zozerta/verse_prose/scrolling_window"
-    corpus_dir = "/home/guyb/hackathon-alloauto/bjornpixel/Sungbum_flat"
+    corpus_dir = "/home/guyb/hackathon-alloauto/bjornpixel/Sungbum_flat_shortened"
     output_dir = "/home/guyb/hackathon-alloauto/bjornpixel/step1_output"
 
     if not os.path.exists(corpus_dir):
