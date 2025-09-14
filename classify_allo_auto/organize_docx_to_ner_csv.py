@@ -156,6 +156,7 @@ if __name__ == "__main__":
     # Your file paths
     input_docx = 'classify_allo_auto/data/Nicola_Bajetta_rNam_gsum_bshad_pa_Auto_vs_Allo_signals_alo_and_auto_cleaned.docx'
 
+
     # Simple CSV output
     output_csv = 'classify_allo_auto/data/output_iob_nicola_rNam_gsum_alo_auto.csv'
     convert_auto_allo_to_csv(input_docx, output_csv)
