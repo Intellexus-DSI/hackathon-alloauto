@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Auto/Allo Classifier</title>
+    <script type="module">
+        import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.4.1';
+
+        let classifier;
+        let MAX_LEN = 512;
+
+        async function loadModel() {
+            document.getElementById("status").innerText = "🔄 Loading model...";
+            classifier = await pipeline('text-classification', 'model/', { quantized: false });
+            document.getElementById("status").innerText = "✅ Model loaded!";
+        }
+
+        function splitChunks(text) {
+            return text.split(/\s*\/+\s*/).map(s => s.trim()).filter(Boolean);
+        }
+
+        function confidenceColor(allo, auto) {
+            const r = Math.floor(255 * allo);
+            const g = Math.floor(255 * (1 - Math.max(auto, allo)));
+            const b = Math.floor(255 * auto);
+            return `rgb(${r},${g},${b})`;
+        }
+
+        async function classifyInput() {
+            const input = document.getElementById("input").value;
+            const results = [];
+            const chunks = splitChunks(input);
+
+            for (let i = 0; i < chunks.length; i++) {
+                const chunk = chunks[i];
+                const result = await classifier(chunk, { topk: 2 });
+                const allo = result.find(r => r.label === "LABEL_0")?.score || 0;
+                const auto = result.find(r => r.label === "LABEL_1")?.score || 0;
+                results.push({ chunk, allo, auto });
+            }
+
+            renderResults(results);
+        }
+
+        function renderResults(results) {
+            const outputDiv = document.getElementById("output");
+            outputDiv.innerHTML = "";
+
+            results.forEach((r, i) => {
+                const color = confidenceColor(r.allo, r.auto);
+                const div = document.createElement("div");
+                div.style = `background:${color}; padding:10px; margin:6px; border-radius:4px;`;
+                div.innerHTML = `
+          <div><strong>Chunk ${i + 1}</strong> — Allo: ${r.allo.toFixed(2)}, Auto: ${r.auto.toFixed(2)}</div>
+          <pre style="white-space:pre-wrap">${r.chunk}</pre>
+        `;
+                outputDiv.appendChild(div);
+            });
+        }
+
+        window.addEventListener('load', loadModel);
+    </script>
+</head>
+
+<body style="font-family: sans-serif; padding: 20px;">
+    <h2>🧠 Autochthonous vs Allochthonous Classifier</h2>
+    <p id="status">Loading model...</p>
+    <textarea id="input" rows="10" cols="100" placeholder="Paste Wylie-transcribed text here..."></textarea><br>
+    <button onclick="classifyInput()">Classify</button>
+    <div id="output" style="margin-top: 20px;"></div>
+</body>
+
+</html>
