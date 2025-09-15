@@ -4,11 +4,13 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Set
-
-from skwarelog import sl_init
+import logging
+# from skwarelog import sl_init
 from tqdm import tqdm
 
-logger = sl_init()
+# logger = sl_init()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 ignore_chars: List[str] = ["/", "@", "#", ";", ":", "(", ")"]
 
@@ -116,7 +118,7 @@ def analyze_verse_matches(input_dir: str, output_dir: str, verbose: bool = False
     derge_lines = []
     derge_line_to_indices = defaultdict(list)  # Maps cleaned line to list of indices
 
-    derge_corpus_path = "/home/mike/data/zozerta/derge_tshad_split_corpus"
+    derge_corpus_path = "/home/guyb/hackathon-alloauto/bjornpixel/derge_tshad_split_ewts"
 
     for root, _, files in os.walk(derge_corpus_path):
         for file in files:
@@ -134,7 +136,7 @@ def analyze_verse_matches(input_dir: str, output_dir: str, verbose: bool = False
     processed_files = 0
     for root, _, files in os.walk(input_dir):
         for file in tqdm(files, desc="Processing files", unit="file"):
-            if file.endswith("_verse_analysis.json") and file.startswith("NG"):
+            if file.endswith("_verse_analysis.json"): # and file.startswith("NG"):
                 input_path = os.path.join(root, file)
                 output_path = os.path.join(output_dir, file)
 
@@ -234,8 +236,8 @@ def print_statistics(output_dir: str):
 
 
 if __name__ == "__main__":
-    input_directory = "/home/mike/data/zozerta/verse_prose/nyingma_scrolling_window"
-    output_directory = "/home/mike/data/zozerta/verse_prose/nyingma_with_derge_analysis"
+    input_directory = "/home/guyb/hackathon-alloauto/bjornpixel/step1_output"
+    output_directory = "/home/guyb/hackathon-alloauto/bjornpixel/step3_output"
 
     analyze_verse_matches(input_directory, output_directory, verbose=True)
     print_statistics(output_directory)
