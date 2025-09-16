@@ -189,7 +189,8 @@ class CodeSwitchingInference:
 # Usage example
 if __name__ == "__main__":
     # Initialize inference
-    inferencer = CodeSwitchingInference('./classify_allo_auto/proximity_cs_model_with_test/final_model')
+    inferencer = CodeSwitchingInference('levshechter/tibetan-code-switching-detector')
+    # inferencer = CodeSwitchingInference('./classify_allo_auto/proximity_cs_model_with_test/final_model')
 
     # Your tagged text
     text = """<auto>thams cad la yang shes par bya'o de la ji ltar de chos thams cad kyi rang bzhin nam bdag nyid yin zhe na 'di nyid las gsungs pa
