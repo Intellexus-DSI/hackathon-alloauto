@@ -41,6 +41,42 @@ for i in range(torch.cuda.device_count()):
 # ============================================================================
 # PART 1: DATA PROCESSING
 # ============================================================================
+def robust_preprocess_text(text_content):
+    """
+    Robust preprocessing that handles various tag formats and text issues.
+    """
+    # Handle all possible tag variations
+    tag_patterns = [
+        (r'<\s*ALLO\s*>', '<allo>'),
+        (r'<\s*allo\s*>', '<allo>'),
+        (r'<\s*Allo\s*>', '<allo>'),
+        (r'<\s*AUTO\s*>', '<auto>'),
+        (r'<\s*auto\s*>', '<auto>'),
+        (r'<\s*Auto\s*>', '<auto>'),
+    ]
+
+    for pattern, replacement in tag_patterns:
+        text_content = re.sub(pattern, replacement, text_content, flags=re.IGNORECASE)
+
+    # Clean up whitespace while preserving tag boundaries
+    # Replace newlines with spaces
+    text_content = text_content.replace('\n', ' ')
+    text_content = text_content.replace('\r', ' ')
+    text_content = text_content.replace('\t', ' ')
+
+    # Replace multiple spaces with single space
+    text_content = re.sub(r'\s+', ' ', text_content)
+
+    # Ensure spaces around tags for cleaner splitting
+    text_content = re.sub(r'<allo>', ' <allo> ', text_content)
+    text_content = re.sub(r'<auto>', ' <auto> ', text_content)
+
+    # Clean up multiple spaces again
+    text_content = re.sub(r'\s+', ' ', text_content)
+
+    return text_content.strip()
+
+
 
 def process_tibetan_4class(docx_path, tokens_csv_path, sequences_csv_path, sequence_length=512):
     """
@@ -456,8 +492,30 @@ def compute_metrics_with_proximity_4class(eval_pred, max_distance=10):
 # ============================================================================
 # PART 5: TRAINER
 # ============================================================================
-
 class ProximityAwareTrainer4Class(Trainer):
+    """Custom trainer for 4-class system."""
+
+    def __init__(self, max_distance=10, distance_weights=None,
+                 switch_loss_weight=10.0, false_positive_penalty=2.0,  # Add this parameter
+                 *args, **kwargs):
+        if 'tokenizer' in kwargs and 'processing_class' not in kwargs:
+            kwargs['processing_class'] = kwargs.get('tokenizer')
+
+        super().__init__(*args, **kwargs)
+        self.proximity_loss = ProximityAwareLoss4Class(
+            max_distance=max_distance,
+            distance_weights=distance_weights,
+            switch_loss_weight=switch_loss_weight,
+            false_positive_penalty=false_positive_penalty  # Pass it to the loss function
+        )
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.get('logits')
+        loss = self.proximity_loss(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+class ProximityAwareTrainer4Class_old(Trainer):
     """Custom trainer for 4-class system."""
 
     def __init__(self, max_distance=10, distance_weights=None,
@@ -582,8 +640,24 @@ def evaluate_on_test_set_4class(model, tokenizer, test_csv='test_sequences.csv',
     detailed_results = []
 
     for idx, row in test_df.iterrows():
-        tokens = row['tokens'].split()
+        # Get the raw tokens
+        raw_tokens = row['tokens'].split()
+
+        # Filter out IOB labels that got mixed in
+        tokens = []
+        for token in raw_tokens:
+            # Skip IOB labels
+            if token not in ['I-ALLO', 'B-ALLO', 'I-AUTO', 'B-AUTO', 'O']:
+                tokens.append(token)
+
+        # Get true labels
         true_labels = list(map(int, row['labels'].split(',')))
+
+        # Make sure labels match tokens length
+        true_labels = true_labels[:len(tokens)]
+
+        if len(tokens) == 0:
+            continue
 
         tokenizer_output = tokenizer(
             tokens,
@@ -594,6 +668,7 @@ def evaluate_on_test_set_4class(model, tokenizer, test_csv='test_sequences.csv',
             max_length=512
         )
 
+        # Rest of the function continues as before...
         word_ids = tokenizer_output.word_ids()
         inputs = {k: v.to(device) for k, v in tokenizer_output.items()}
 
@@ -627,7 +702,7 @@ def evaluate_on_test_set_4class(model, tokenizer, test_csv='test_sequences.csv',
 
         detailed_results.append({
             'sequence_idx': idx,
-            'tokens': tokens[:final_len],
+            'tokens': tokens[:final_len],  # Now contains only actual tokens
             'true_labels': aligned_labels,
             'predictions': aligned_predictions,
             'has_true_switches': len(true_switches) > 0,
@@ -702,38 +777,534 @@ def evaluate_on_test_set_4class(model, tokenizer, test_csv='test_sequences.csv',
 # PART 9: MAIN PIPELINE
 # ============================================================================
 
-def train_and_evaluate_4class_pipeline():
-    """Complete pipeline for 4-class system."""
 
-    # Step 1: Process data
-    print("Step 1: Processing .docx file with 4-class system...")
-    token_df, seq_df = process_tibetan_4class(
-        'classify_allo_auto/data/Nicola_Bajetta_rNam_gsum_bshad_pa_Auto_vs_Allo_signals_alo_and_auto_cleaned.docx',
-        'classify_allo_auto/data/tokens_4class.csv',
-        'classify_allo_auto/data/sequences_4class.csv',
+import os
+from pathlib import Path
+import pandas as pd
+from typing import List, Tuple
+
+
+def process_multiple_docx_files(data_dir: str, output_dir: str = None, sequence_length: int = 512):
+    """
+    Process all .docx files in a directory and combine them into single dataset.
+
+    Args:
+        data_dir: Directory containing .docx files
+        output_dir: Output directory for combined CSV files
+        sequence_length: Length of sequences for splitting
+
+    Returns:
+        Combined token_df and sequences_df
+    """
+    if output_dir is None:
+        output_dir = data_dir
+
+    # Find all .docx files
+    docx_files = list(Path(data_dir).glob("*.docx"))
+    print("docx_files: ")
+    print(docx_files)
+
+
+    print(f"Found {len(docx_files)} .docx files in {data_dir}")
+
+    all_tokens_dfs = []
+    all_sequences_dfs = []
+
+    # Process each file
+    for idx, docx_path in enumerate(docx_files):
+        print(f"\n[{idx + 1}/{len(docx_files)}] Processing: {docx_path.name}")
+
+        try:
+            # Create temporary output paths for this file
+            temp_tokens_path = Path(output_dir) / f"temp_tokens_{idx}.csv"
+            temp_sequences_path = Path(output_dir) / f"temp_sequences_{idx}.csv"
+
+            # Process the file
+            token_df, seq_df = process_tibetan_4class(
+                str(docx_path),
+                str(temp_tokens_path),
+                str(temp_sequences_path),
+                sequence_length=sequence_length
+            )
+
+            # Add file source information
+            token_df['source_file'] = docx_path.name
+            token_df['file_id'] = idx
+
+            seq_df['source_file'] = docx_path.name
+            seq_df['file_id'] = idx
+
+            all_tokens_dfs.append(token_df)
+            all_sequences_dfs.append(seq_df)
+
+            # Clean up temp files
+            temp_tokens_path.unlink(missing_ok=True)
+            temp_sequences_path.unlink(missing_ok=True)
+
+        except Exception as e:
+            print(f"  ERROR processing {docx_path.name}: {e}")
+            continue
+
+    if not all_tokens_dfs:
+        raise ValueError("No files were successfully processed!")
+
+    # Combine all dataframes
+    print("\n=== Combining all processed files ===")
+    combined_tokens_df = pd.concat(all_tokens_dfs, ignore_index=True)
+    combined_sequences_df = pd.concat(all_sequences_dfs, ignore_index=True)
+
+    # Reassign sequence IDs to be unique across all files
+    combined_sequences_df['sequence_id'] = range(len(combined_sequences_df))
+
+    # Save combined data
+    combined_tokens_path = Path(output_dir) / 'all_tokens_combined.csv'
+    combined_sequences_path = Path(output_dir) / 'all_sequences_combined.csv'
+
+    combined_tokens_df.to_csv(combined_tokens_path, index=False)
+    combined_sequences_df.to_csv(combined_sequences_path, index=False)
+
+    # Print combined statistics
+    print(f"\n=== Combined Dataset Statistics ===")
+    print(f"Total files processed: {len(docx_files)}")
+    print(f"Total tokens: {len(combined_tokens_df)}")
+    print(f"Total sequences: {len(combined_sequences_df)}")
+
+    # Label distribution across all files
+    print(f"\nCombined label distribution:")
+    label_names = ['Non-switch Auto', 'Non-switch Allo', 'Switch to Auto', 'Switch to Allo']
+    for i in range(4):
+        count = (combined_tokens_df['label'] == i).sum()
+        percentage = count / len(combined_tokens_df) * 100
+        print(f"  Class {i} ({label_names[i]}): {count} ({percentage:.2f}%)")
+
+    # Switch statistics
+    switch_sequences = combined_sequences_df[combined_sequences_df['contains_switch'] == 1]
+    print(
+        f"\nSequences with switches: {len(switch_sequences)} ({len(switch_sequences) / len(combined_sequences_df) * 100:.1f}%)")
+    print(f"Total switches to auto: {combined_sequences_df['num_to_auto'].sum()}")
+    print(f"Total switches to allo: {combined_sequences_df['num_to_allo'].sum()}")
+
+    # Per-file statistics
+    print(f"\n=== Per-file Statistics ===")
+    for file_id, file_name in combined_sequences_df[['file_id', 'source_file']].drop_duplicates().values:
+        file_seqs = combined_sequences_df[combined_sequences_df['file_id'] == file_id]
+        file_switches = file_seqs['contains_switch'].sum()
+        print(f"  {file_name}: {len(file_seqs)} sequences, {file_switches} with switches")
+
+    return combined_tokens_df, combined_sequences_df
+
+
+def stratified_split_combined_data(combined_sequences_path: str,
+                                   train_ratio: float = 0.7,
+                                   val_ratio: float = 0.15,
+                                   test_ratio: float = 0.15,
+                                   ensure_file_diversity: bool = True):
+    """
+    Create stratified train/val/test split from combined data.
+
+    Args:
+        combined_sequences_path: Path to combined sequences CSV
+        train_ratio: Proportion for training
+        val_ratio: Proportion for validation
+        test_ratio: Proportion for testing
+        ensure_file_diversity: If True, ensure each split has data from multiple files
+    """
+    df = pd.read_csv(combined_sequences_path)
+
+    if ensure_file_diversity and 'file_id' in df.columns:
+        # Group by file and switch status for more balanced splitting
+        groups = []
+        for file_id in df['file_id'].unique():
+            file_df = df[df['file_id'] == file_id]
+
+            # Split this file's data
+            switch_seqs = file_df[file_df['contains_switch'] == 1]
+            no_switch_seqs = file_df[file_df['contains_switch'] == 0]
+
+            for seq_group in [switch_seqs, no_switch_seqs]:
+                if len(seq_group) > 0:
+                    n = len(seq_group)
+                    n_train = int(n * train_ratio)
+                    n_val = int(n * val_ratio)
+
+                    train = seq_group.iloc[:n_train]
+                    val = seq_group.iloc[n_train:n_train + n_val]
+                    test = seq_group.iloc[n_train + n_val:]
+
+                    groups.append({
+                        'train': train,
+                        'val': val,
+                        'test': test
+                    })
+
+        # Combine all groups
+        train_data = pd.concat([g['train'] for g in groups if len(g['train']) > 0])
+        val_data = pd.concat([g['val'] for g in groups if len(g['val']) > 0])
+        test_data = pd.concat([g['test'] for g in groups if len(g['test']) > 0])
+
+    else:
+        # Use original stratified split logic
+        switch_sequences = df[df['contains_switch'] == 1]
+        no_switch_sequences = df[df['contains_switch'] == 0]
+
+        def split_group(group_df, train_r, val_r, test_r):
+            n = len(group_df)
+            n_train = int(n * train_r)
+            n_val = int(n * val_r)
+
+            train = group_df.iloc[:n_train]
+            val = group_df.iloc[n_train:n_train + n_val]
+            test = group_df.iloc[n_train + n_val:]
+
+            return train, val, test
+
+        switch_train, switch_val, switch_test = split_group(switch_sequences, train_ratio, val_ratio, test_ratio)
+        no_switch_train, no_switch_val, no_switch_test = split_group(no_switch_sequences, train_ratio, val_ratio,
+                                                                     test_ratio)
+
+        train_data = pd.concat([switch_train, no_switch_train])
+        val_data = pd.concat([switch_val, no_switch_val])
+        test_data = pd.concat([switch_test, no_switch_test])
+
+    # Shuffle
+    train_data = train_data.sample(frac=1, random_state=42).reset_index(drop=True)
+    val_data = val_data.sample(frac=1, random_state=42).reset_index(drop=True)
+    test_data = test_data.sample(frac=1, random_state=42).reset_index(drop=True)
+
+    # Save splits
+    train_data.to_csv('train_sequences_combined.csv', index=False)
+    val_data.to_csv('val_sequences_combined.csv', index=False)
+    test_data.to_csv('test_sequences_combined.csv', index=False)
+
+    print(f"\n=== Combined Data Train/Val/Test Split ===")
+    print(f"Training: {len(train_data)} sequences")
+    print(f"  With switches: {train_data['contains_switch'].sum()} ({train_data['contains_switch'].mean() * 100:.1f}%)")
+    if 'file_id' in train_data.columns:
+        print(f"  From {train_data['file_id'].nunique()} different files")
+
+    print(f"Validation: {len(val_data)} sequences")
+    print(f"  With switches: {val_data['contains_switch'].sum()} ({val_data['contains_switch'].mean() * 100:.1f}%)")
+    if 'file_id' in val_data.columns:
+        print(f"  From {val_data['file_id'].nunique()} different files")
+
+    print(f"Test: {len(test_data)} sequences")
+    print(f"  With switches: {test_data['contains_switch'].sum()} ({test_data['contains_switch'].mean() * 100:.1f}%)")
+    if 'file_id' in test_data.columns:
+        print(f"  From {test_data['file_id'].nunique()} different files")
+
+    return train_data, val_data, test_data
+
+def process_tibetan_4class_from_text(text_content, tokens_csv_path, sequences_csv_path, sequence_length=512):
+    """
+    Process Tibetan text content with 4-class labeling system.
+    This is a refactored version that works with raw text content.
+    """
+    text_content = robust_preprocess_text(text_content)
+
+    # Now continue with the rest of your processing...
+    parts = re.split(r'(<auto>|<allo>)', text_content)
+    tokens = []
+    labels = []
+    current_mode = None  # Start with unknown mode
+
+
+    for i, part in enumerate(parts):
+        if part == '<auto>':
+            next_mode = 'auto'
+        elif part == '<allo>':
+            next_mode = 'allo'
+        elif part.strip():
+            words = part.strip().split()
+
+            for word_idx, word in enumerate(words):
+                tokens.append(word)
+
+                # Determine label
+                if word_idx == 0 and i > 0:  # First word after a tag
+                    prev_part = parts[i - 1]
+                    if prev_part == '<auto>':
+                        if current_mode == 'allo':
+                            labels.append(2)  # Switch TO auto
+                        else:
+                            labels.append(0)  # Continue in auto
+                        current_mode = 'auto'
+                    elif prev_part == '<allo>':
+                        if current_mode == 'auto':
+                            labels.append(3)  # Switch TO allo
+                        else:
+                            labels.append(1)  # Continue in allo
+                        current_mode = 'allo'
+                    else:
+                        # Continue current mode
+                        if current_mode == 'auto':
+                            labels.append(0)
+                        elif current_mode == 'allo':
+                            labels.append(1)
+                        else:
+                            labels.append(0)  # Default to auto if unknown
+                else:
+                    # Not a switch point
+                    if current_mode == 'auto':
+                        labels.append(0)
+                    elif current_mode == 'allo':
+                        labels.append(1)
+                    else:
+                        labels.append(0)  # Default
+
+    # Create DataFrames
+    token_df = pd.DataFrame({
+        'token': tokens,
+        'label': labels,
+        'mode': ['auto' if l in [0, 2] else 'allo' for l in labels]
+    })
+
+    sequences = []
+    for i in range(0, len(tokens), sequence_length):
+        seq_tokens = tokens[i:i + sequence_length]
+        seq_labels = labels[i:i + sequence_length]
+
+        if len(seq_tokens) > 0:
+            num_switches = sum(1 for l in seq_labels if l in [2, 3])
+            contains_switch = 1 if num_switches > 0 else 0
+
+            sequences.append({
+                'sequence_id': len(sequences),
+                'tokens': ' '.join(seq_tokens),
+                'labels': ','.join(map(str, seq_labels)),
+                'length': len(seq_tokens),
+                'num_switches': num_switches,
+                'contains_switch': contains_switch,
+                'num_to_auto': sum(1 for l in seq_labels if l == 2),
+                'num_to_allo': sum(1 for l in seq_labels if l == 3)
+            })
+
+    sequences_df = pd.DataFrame(sequences)
+
+    # Save
+    token_df.to_csv(tokens_csv_path, index=False)
+    sequences_df.to_csv(sequences_csv_path, index=False)
+
+    # Print statistics
+    print(f"\n=== 4-Class Processing Complete ===")
+    print(f"Total tokens: {len(tokens)}")
+    print(f"Total sequences: {len(sequences)}")
+    print(f"\nLabel distribution:")
+    label_names = ['Non-switch Auto', 'Non-switch Allo', 'Switch to Auto', 'Switch to Allo']
+    for i in range(4):
+        count = sum(1 for l in labels if l == i)
+        print(f"  Class {i} ({label_names[i]}): {count} ({count / len(labels) * 100:.2f}%)")
+
+    return token_df, sequences_df
+
+
+def process_mixed_files(data_dir: str, output_dir: str = None, sequence_length: int = 512):
+    """
+    Process all .docx and .txt files in a directory and combine them into single dataset.
+
+    Args:
+        data_dir: Directory containing .docx and .txt files
+        output_dir: Output directory for combined CSV files
+        sequence_length: Length of sequences for splitting
+
+    Returns:
+        Combined token_df and sequences_df
+    """
+    if output_dir is None:
+        output_dir = data_dir
+
+    # Find all .docx and .txt files
+    docx_files = list(Path(data_dir).glob("*.docx"))
+    txt_files = list(Path(data_dir).glob("*.txt"))
+
+    all_files = [(f, 'docx') for f in docx_files] + [(f, 'txt') for f in txt_files]
+
+    print(f"Found {len(docx_files)} .docx files and {len(txt_files)} .txt files in {data_dir}")
+    print(f"Total files to process: {len(all_files)}")
+
+    all_tokens_dfs = []
+    all_sequences_dfs = []
+
+    # Process each file
+    for idx, (file_path, file_type) in enumerate(all_files):
+        print(f"\n[{idx + 1}/{len(all_files)}] Processing ({file_type}): {file_path.name}")
+
+        try:
+            # Create temporary output paths for this file
+            temp_tokens_path = Path(output_dir) / f"temp_tokens_{idx}.csv"
+            temp_sequences_path = Path(output_dir) / f"temp_sequences_{idx}.csv"
+
+            # Process based on file type
+            if file_type == 'docx':
+                # Read docx file
+                doc = docx.Document(str(file_path))
+                text_content = ' '.join([para.text for para in doc.paragraphs])
+            else:  # txt file
+                # Read txt file with various encodings
+                encodings = ['utf-8', 'utf-16', 'latin-1', 'cp1252']
+                text_content = None
+
+                for encoding in encodings:
+                    try:
+                        with open(file_path, 'r', encoding=encoding) as f:
+                            text_content = f.read()
+                        print(f"  Successfully read with {encoding} encoding")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+
+                if text_content is None:
+                    print(f"  ERROR: Could not read {file_path.name} with any encoding")
+                    continue
+
+            # Process the text content
+            token_df, seq_df = process_tibetan_4class_from_text(
+                text_content,
+                str(temp_tokens_path),
+                str(temp_sequences_path),
+                sequence_length=sequence_length
+            )
+
+            # Add file source information
+            token_df['source_file'] = file_path.name
+            token_df['file_id'] = idx
+            token_df['file_type'] = file_type
+
+            seq_df['source_file'] = file_path.name
+            seq_df['file_id'] = idx
+            seq_df['file_type'] = file_type
+
+            all_tokens_dfs.append(token_df)
+            all_sequences_dfs.append(seq_df)
+
+            # Clean up temp files
+            temp_tokens_path.unlink(missing_ok=True)
+            temp_sequences_path.unlink(missing_ok=True)
+
+        except Exception as e:
+            print(f"  ERROR processing {file_path.name}: {e}")
+            continue
+
+    if not all_tokens_dfs:
+        raise ValueError("No files were successfully processed!")
+
+    # Combine all dataframes
+    print("\n=== Combining all processed files ===")
+    combined_tokens_df = pd.concat(all_tokens_dfs, ignore_index=True)
+    combined_sequences_df = pd.concat(all_sequences_dfs, ignore_index=True)
+
+    # Reassign sequence IDs to be unique across all files
+    combined_sequences_df['sequence_id'] = range(len(combined_sequences_df))
+
+    # Save combined data
+    combined_tokens_path = Path(output_dir) / 'all_tokens_combined.csv'
+    combined_sequences_path = Path(output_dir) / 'all_sequences_combined.csv'
+
+    combined_tokens_df.to_csv(combined_tokens_path, index=False)
+    combined_sequences_df.to_csv(combined_sequences_path, index=False)
+
+    # Print combined statistics
+    print(f"\n=== Combined Dataset Statistics ===")
+    print(f"Total files processed: {len(all_files)}")
+    print(
+        f"  .docx files: {len([f for f in all_sequences_dfs if 'file_type' in f.columns and f['file_type'].iloc[0] == 'docx'])}")
+    print(
+        f"  .txt files: {len([f for f in all_sequences_dfs if 'file_type' in f.columns and f['file_type'].iloc[0] == 'txt'])}")
+    print(f"Total tokens: {len(combined_tokens_df)}")
+    print(f"Total sequences: {len(combined_sequences_df)}")
+
+    # Label distribution across all files
+    print(f"\nCombined label distribution:")
+    label_names = ['Non-switch Auto', 'Non-switch Allo', 'Switch to Auto', 'Switch to Allo']
+    for i in range(4):
+        count = (combined_tokens_df['label'] == i).sum()
+        percentage = count / len(combined_tokens_df) * 100
+        print(f"  Class {i} ({label_names[i]}): {count} ({percentage:.2f}%)")
+
+    # Switch statistics
+    switch_sequences = combined_sequences_df[combined_sequences_df['contains_switch'] == 1]
+    print(
+        f"\nSequences with switches: {len(switch_sequences)} ({len(switch_sequences) / len(combined_sequences_df) * 100:.1f}%)")
+    print(f"Total switches to auto: {combined_sequences_df['num_to_auto'].sum()}")
+    print(f"Total switches to allo: {combined_sequences_df['num_to_allo'].sum()}")
+
+    # Per-file statistics
+    print(f"\n=== Per-file Statistics ===")
+    for file_id, file_name, file_type in combined_sequences_df[
+        ['file_id', 'source_file', 'file_type']].drop_duplicates().values:
+        file_seqs = combined_sequences_df[combined_sequences_df['file_id'] == file_id]
+        file_switches = file_seqs['contains_switch'].sum()
+    return combined_tokens_df, combined_sequences_df
+
+
+
+def train_on_combined_data_pipeline():
+    """
+    Complete pipeline for training on multiple documents.
+    """
+
+    data_dir = 'classify_allo_auto/data'  # Directory with your files
+    output_dir = 'classify_allo_auto/combined_data'  # Output directory
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Process all files (both .docx and .txt)
+    combined_tokens, combined_sequences = process_mixed_files(
+        data_dir=data_dir,
+        output_dir=output_dir,
         sequence_length=512
     )
 
-    # Step 2: Split data
-    print("\nStep 2: Creating stratified train/val/test split...")
-    train_df, val_df, test_df = stratified_split_for_sequences_4class(
-        'classify_allo_auto/data/sequences_4class.csv',
+    # Rest of the pipeline remains the same...
+    # Step 2: Create train/val/test split
+    print("\n" + "=" * 60)
+    print("STEP 2: Creating train/val/test split")
+    print("=" * 60)
+
+    train_df, val_df, test_df = stratified_split_combined_data(
+        combined_sequences_path=f'{output_dir}/all_sequences_combined.csv',
         train_ratio=0.7,
         val_ratio=0.15,
-        test_ratio=0.15
+        test_ratio=0.15,
+        ensure_file_diversity=True
     )
 
     # Step 3: Augment training data
-    print("\nStep 3: Augmenting training data...")
-    augmented_train = augment_training_data_4class(
-        'train_sequences.csv',
-        augmentation_factor=3
-    )
+    print("\n" + "=" * 60)
+    print("STEP 3: Augmenting training data")
+    print("=" * 60)
 
-    # Step 4: Initialize model and tokenizer
-    print("\nStep 4: Initializing model and tokenizer...")
+    train_csv = 'train_sequences_combined.csv'
+    train_df = pd.read_csv(train_csv)
+
+    switch_sequences = train_df[train_df['contains_switch'] == 1]
+    no_switch_sequences = train_df[train_df['contains_switch'] == 0]
+
+    augmentation_factor = 5
+    augmented_switches = pd.concat([switch_sequences] * augmentation_factor)
+
+    n_no_switch = min(len(no_switch_sequences), len(augmented_switches) * 2)
+    balanced_no_switch = no_switch_sequences.sample(n=n_no_switch, random_state=42, replace=True)
+
+    augmented_train = pd.concat([augmented_switches, balanced_no_switch])
+    augmented_train = augmented_train.sample(frac=1, random_state=42).reset_index(drop=True)
+    augmented_train.to_csv('train_sequences_combined_augmented.csv', index=False)
+
+    print(f"Augmented training data:")
+    print(f"  Total sequences: {len(augmented_train)}")
+
+    print(f"Augmented training data:")
+    print(f"  Total sequences: {len(augmented_train)}")
+    print(
+        f"  With switches: {augmented_train['contains_switch'].sum()} ({augmented_train['contains_switch'].mean() * 100:.1f}%)")
+
+    # Step 4: Initialize model and train
+    print("\n" + "=" * 60)
+    print("STEP 4: Training model on combined data")
+    print("=" * 60)
+
     model_name = 'OMRIDRORI/mbert-tibetan-continual-unicode-240k'
-    output_dir = './classify_allo_auto/proximity_cs_model_4class'
+    output_model_dir = './classify_allo_auto/combined_model_4class'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -755,35 +1326,40 @@ def train_and_evaluate_4class_pipeline():
             3: 'to_allo'
         }
     )
+
+    # Initialize with better bias for rare classes
+    with torch.no_grad():
+        model.classifier.bias.data[2] = 5.0  # Bias for switch to auto
+        model.classifier.bias.data[3] = 5.0  # Bias for switch to allo
+
     model = model.to(device)
 
-    # Step 5: Create datasets
-    print("\nStep 5: Creating datasets...")
-    train_dataset = CodeSwitchingDataset4Class('train_sequences_augmented.csv', tokenizer)
-    val_dataset = CodeSwitchingDataset4Class('val_sequences.csv', tokenizer)
+    # Create datasets
+    train_dataset = CodeSwitchingDataset4Class('train_sequences_combined_augmented.csv', tokenizer)
+    val_dataset = CodeSwitchingDataset4Class('val_sequences_combined.csv', tokenizer)
 
     data_collator = DataCollatorForTokenClassification(tokenizer)
 
-    # Step 6: Set up training
-    print("\nStep 6: Setting up training...")
+    # Training arguments with adjustments for combined data
+    # Training arguments with adjustments for combined data
     training_args = TrainingArguments(
-        output_dir=output_dir,
+        output_dir=output_model_dir,
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=200,
         save_strategy="steps",
-        save_steps=200,
+        save_steps=400,  # Changed from 500 to 400 (multiple of 200)
         learning_rate=1e-5,
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
-        num_train_epochs=25,
+        num_train_epochs=10,
         weight_decay=0.01,
-        logging_dir=f'{output_dir}/logs',
-        logging_steps=20,
+        logging_dir=f'{output_model_dir}/logs',
+        logging_steps=50,
         load_best_model_at_end=True,
         metric_for_best_model='proximity_f1',
         greater_is_better=True,
-        warmup_steps=500,
-        save_total_limit=1,
+        warmup_steps=1000,
+        save_total_limit=2,
         gradient_accumulation_steps=2,
         fp16=torch.cuda.is_available(),
     )
@@ -791,6 +1367,7 @@ def train_and_evaluate_4class_pipeline():
     def compute_metrics(eval_pred):
         return compute_metrics_with_proximity_4class(eval_pred, max_distance=10)
 
+    # Use higher switch loss weight for combined data
     trainer = ProximityAwareTrainer4Class(
         model=model,
         args=training_args,
@@ -801,49 +1378,95 @@ def train_and_evaluate_4class_pipeline():
         compute_metrics=compute_metrics,
         max_distance=10,
         distance_weights=[1.0, 0.99, 0.95, 0.9, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55],
-        # switch_loss_weight=15
-        switch_loss_weight = 50.0
+        switch_loss_weight=30.0,  # Much lower!
+        false_positive_penalty=1.0  # Increase this!
     )
 
-    # Step 7: Train
-    print("\nStep 7: Starting training...")
+    # Train
     trainer.train()
 
     # Save model
-    trainer.save_model(f'{output_dir}/final_model')
-    tokenizer.save_pretrained(f'{output_dir}/final_model')
+    trainer.save_model(f'{output_model_dir}/final_model')
+    tokenizer.save_pretrained(f'{output_model_dir}/final_model')
 
-    # Push to hub (optional)
-    # model.push_to_hub("your-username/tibetan-code-switching-4class")
-    # tokenizer.push_to_hub("your-username/tibetan-code-switching-4class")
+    model.push_to_hub("levshechter/tibetan-code-switching-detector")
+    tokenizer.push_to_hub("levshechter/tibetan-code-switching-detector")
 
-    # Step 8: Evaluate
-    print("\nStep 8: Evaluating on test set...")
+    # Or push the trainer (includes training args)
+    trainer.push_to_hub("levshechter/tibetan-code-switching-detector")
+
+    # Step 5: Evaluate on test set
+    print("\n" + "=" * 60)
+    print("STEP 5: Evaluating on combined test set")
+    print("=" * 60)
+    # Step 5: Evaluate on test set (existing code)
+    print("\n" + "=" * 60)
+    print("STEP 5: Evaluating on combined test set")
+    print("=" * 60)
+
     test_metrics, test_results = evaluate_on_test_set_4class(
         model,
         tokenizer,
-        'test_sequences.csv',
+        'test_sequences_combined.csv',
         max_distance=10
     )
 
+    # Step 5b: NEW - Switch detection evaluation
     print("\n" + "=" * 60)
-    print("PIPELINE COMPLETE!")
+    print("STEP 5b: Switch Detection Evaluation")
     print("=" * 60)
-    print(f"\nModel saved to: {output_dir}/final_model")
-    print(f"Test F1 Score: {test_metrics['proximity_f1']:.3f}")
+    from switch_detection_evaluation import evaluate_model_on_test_switch_detection
 
-    if test_metrics['proximity_f1'] < 0.1:
-        print("\n⚠️ WARNING: Very low F1 score detected!")
-        print("Consider:")
-        print("- Adjusting switch_loss_weight (try 20-30)")
-        print("- Changing augmentation_factor")
-        print("- Checking data quality")
+    switch_metrics, switch_results = evaluate_model_on_test_switch_detection(
+        model,
+        tokenizer,
+        'test_sequences_combined.csv',
+        tolerance=5
+    )
+
+    print("\n" + "=" * 60)
+    print("COMBINED DATA PIPELINE COMPLETE!")
+    print("=" * 60)
+    print(f"Model saved to: {output_model_dir}/final_model")
+    print(f"Token-level F1 Score: {test_metrics['proximity_f1']:.3f}")
+    print(f"Switch Detection F1 Score (±5 tokens): {switch_metrics['f1']:.3f}")
     import ipdb
     ipdb.set_trace()
+    return trainer, model, tokenizer, test_metrics, switch_metrics
 
-    return trainer, model, tokenizer, test_metrics
+    # test_metrics, test_results = evaluate_on_test_set_4class(
+    #     model,
+    #     tokenizer,
+    #     'test_sequences_combined.csv',
+    #     max_distance=10
+    # )
+    #
+    # print("\n" + "=" * 60)
+    # print("COMBINED DATA PIPELINE COMPLETE!")
+    # print("=" * 60)
+    # print(f"Model saved to: {output_model_dir}/final_model")
+    # print(f"Test F1 Score: {test_metrics['proximity_f1']:.3f}")
+    # import ipdb
+    # ipdb.set_trace()
 
-
-
+# Run the combined pipeline
 if __name__ == "__main__":
-    train_and_evaluate_4class_pipeline()
+    # First, process all documents
+    data_dir = 'classify_allo_auto/data'  # Change this to your data directory
+    output_dir = 'classify_allo_auto/combined_data'
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Process and combine all documents
+    combined_tokens, combined_sequences = process_multiple_docx_files(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        sequence_length=512
+    )
+
+    # Then run the full training pipeline
+    trainer, model, tokenizer, test_metrics = train_on_combined_data_pipeline()
+    import ipdb; ipdb.set_trace()
+#
+# if __name__ == "__main__":
+#     train_and_evaluate_4class_pipeline()

@@ -11,7 +11,7 @@ class CodeSwitchingInference4Class:
         """Load the trained 4-class model and tokenizer."""
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForTokenClassification.from_pretrained(model_path)
+        self.model = AutoModelForTokenClassification.from_pretrained(model_path, local_files_only=False)
         self.model.to(self.device)
         self.model.eval()
 
@@ -616,7 +616,7 @@ class CodeSwitchingInference4Class:
 # Usage example
 if __name__ == "__main__":
     # Initialize inference with your trained model
-    inferencer = CodeSwitchingInference4Class('./classify_allo_auto/combined_model_4class/final_model')
+    inferencer = CodeSwitchingInference4Class('levshechter/tibetan-code-switching-detector')
     # Or use from HuggingFace:
     # inferencer = CodeSwitchingInference4Class('levshechter/tibetan-code-switching-detector')
 
