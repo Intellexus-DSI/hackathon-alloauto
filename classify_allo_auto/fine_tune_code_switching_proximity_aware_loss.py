@@ -29,7 +29,140 @@ import numpy as np
 from typing import List, Tuple, Dict
 from transformers import Trainer
 
+"""
+Fixed Proximity-aware loss function and metrics for code-switching detection.
+Corrects the UnboundLocalError issue with min_distance variable.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import List, Tuple, Dict
+
+
 class ProximityAwareLoss(nn.Module):
+    """
+    Custom loss that gives partial credit for predictions near true switch points.
+    """
+
+    def __init__(self, max_distance=10, distance_weights=None, class_weights=None,
+                 switch_loss_weight=10.0, proximity_bonus=True, false_positive_penalty=2):
+        """
+        Args:
+            max_distance: Maximum distance (in tokens) to consider for partial credit
+            distance_weights: Weights for different distances [exact, 1-off, 2-off, ..., 10-off]
+            class_weights: Weights for different classes [no_switch, to_auto, to_allo]
+            switch_loss_weight: Extra weight for switch classes (1 and 2)
+            proximity_bonus: Whether to give bonus for predictions near true switches
+            false_positive_penalty: Penalty multiplier for false positive switch predictions
+        """
+        super().__init__()
+        self.max_distance = max_distance
+
+        # Default distance weights: gradual decay
+        if distance_weights is None:
+            self.distance_weights = torch.tensor([1.0, 0.99, 0.95, 0.9, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55])
+        else:
+            self.distance_weights = torch.tensor(distance_weights)
+
+        # Default class weights
+        if class_weights is None:
+            self.class_weights = torch.tensor([1.0, switch_loss_weight, switch_loss_weight])
+        else:
+            self.class_weights = torch.tensor(class_weights)
+
+        self.proximity_bonus = proximity_bonus
+        self.false_positive_penalty = false_positive_penalty
+
+    def forward(self, logits, labels):
+        """
+        Compute proximity-aware loss.
+
+        Args:
+            logits: Model predictions (batch_size, seq_len, num_classes)
+            labels: True labels (batch_size, seq_len)
+        """
+        batch_size, seq_len, num_classes = logits.shape
+        device = logits.device
+
+        # Move weights to device
+        self.distance_weights = self.distance_weights.to(device)
+        self.class_weights = self.class_weights.to(device)
+
+        # Standard cross-entropy loss
+        ce_loss = F.cross_entropy(
+            logits.view(-1, num_classes),
+            labels.view(-1),
+            weight=self.class_weights,
+            reduction='none'
+        ).view(batch_size, seq_len)
+
+        # Mask for valid tokens (not -100)
+        valid_mask = (labels != -100).float()
+
+        # Find switch points (classes 1 and 2)
+        switch_mask = ((labels == 1) | (labels == 2)).float()
+        predictions = torch.argmax(logits, dim=-1)
+        pred_switch_mask = ((predictions == 1) | (predictions == 2)).float()
+
+        # Initialize proximity bonus
+        proximity_bonus = torch.zeros_like(ce_loss)
+
+        if self.proximity_bonus:
+            # For each predicted switch, check if there's a true switch nearby
+            for b in range(batch_size):
+                # Get positions of true and predicted switches
+                true_switch_pos = torch.where(switch_mask[b] == 1)[0]
+                pred_switch_pos = torch.where(pred_switch_mask[b] == 1)[0]
+
+                # For each predicted switch
+                for pred_pos in pred_switch_pos:
+                    if valid_mask[b, pred_pos] == 0:
+                        continue
+
+                    # Find nearest true switch
+                    if len(true_switch_pos) > 0:
+                        distances = torch.abs(true_switch_pos - pred_pos)
+                        min_distance = torch.min(distances).item()
+
+                        # If within max_distance, apply bonus (reduce loss)
+                        if min_distance <= self.max_distance:
+                            weight = self.distance_weights[min(min_distance, len(self.distance_weights) - 1)]
+                            # Use weight directly to reduce loss for good predictions
+                            proximity_bonus[b, pred_pos] = ce_loss[b, pred_pos] * weight * 0.5
+
+                # For each true switch, penalize if no prediction nearby
+                for true_pos in true_switch_pos:
+                    if valid_mask[b, true_pos] == 0:
+                        continue
+
+                    # Check if there's a predicted switch nearby
+                    if len(pred_switch_pos) > 0:
+                        distances = torch.abs(pred_switch_pos - true_pos)
+                        min_distance = torch.min(distances).item()
+
+                        # If no prediction within max_distance, add extra penalty
+                        if min_distance > self.max_distance:
+                            ce_loss[b, true_pos] *= 2.0  # Double the loss for missed switches
+
+        # Apply proximity bonus (reduces loss for good predictions)
+        ce_loss = ce_loss - proximity_bonus
+
+        # Apply valid mask and compute mean
+        masked_loss = ce_loss * valid_mask
+
+        # Add false positive penalty
+        false_positive_mask = (pred_switch_mask * (1 - switch_mask)) * valid_mask
+        false_positive_penalty = false_positive_mask * self.false_positive_penalty
+
+        # Combine losses and compute scalar mean
+        total_loss = masked_loss + false_positive_penalty
+        loss = total_loss.sum() / valid_mask.sum().clamp(min=1)
+
+        return loss
+
+class ProximityAwareLoss_old(nn.Module):
     """
     Custom loss that gives partial credit for predictions near true switch points.
     """
@@ -138,8 +271,14 @@ class ProximityAwareLoss(nn.Module):
                             ce_loss[b, true_pos] *= 2.0  # Double the loss for missed switches
         
         # Apply proximity bonus
+        # ce_loss = ce_loss - proximity_bonus
+        if min_distance <= self.max_distance:
+            weight = self.distance_weights[min(min_distance, len(self.distance_weights) - 1)]
+            # Use weight directly, not (1 - weight)
+            proximity_bonus[b, pred_pos] = ce_loss[b, pred_pos] * weight * 0.5
+
+        # Later, apply the bonus (reduces loss for good predictions)
         ce_loss = ce_loss - proximity_bonus
-        
         # Apply valid mask and compute mean
         masked_loss = ce_loss * valid_mask
 
@@ -726,6 +865,289 @@ class CodeSwitchingDataset(Dataset):
         return tokenized_inputs
 
 
+"""
+Fixed training and evaluation pipeline for code-switching detection.
+Addresses data imbalance, evaluation bugs, and training issues.
+"""
+
+import torch
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from collections import defaultdict
+import json
+
+
+def stratified_split_for_sequences(sequences_csv, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
+    """
+    Create stratified train/val/test split ensuring switch examples in all splits.
+    """
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 0.001, "Ratios must sum to 1"
+
+    df = pd.read_csv(sequences_csv)
+
+    # Separate sequences with and without switches
+    switch_sequences = df[df['contains_switch'] == 1]
+    no_switch_sequences = df[df['contains_switch'] == 0]
+
+    print(f"Total sequences: {len(df)}")
+    print(f"  With switches: {len(switch_sequences)}")
+    print(f"  Without switches: {len(no_switch_sequences)}")
+
+    # Split each group separately to maintain distribution
+    def split_group(group_df, train_r, val_r, test_r):
+        n = len(group_df)
+        n_train = int(n * train_r)
+        n_val = int(n * val_r)
+
+        train = group_df.iloc[:n_train]
+        val = group_df.iloc[n_train:n_train + n_val]
+        test = group_df.iloc[n_train + n_val:]
+
+        return train, val, test
+
+    # Split both groups
+    switch_train, switch_val, switch_test = split_group(switch_sequences, train_ratio, val_ratio, test_ratio)
+    no_switch_train, no_switch_val, no_switch_test = split_group(no_switch_sequences, train_ratio, val_ratio,
+                                                                 test_ratio)
+
+    # Combine and shuffle within each split
+    train_data = pd.concat([switch_train, no_switch_train]).sample(frac=1, random_state=42).reset_index(drop=True)
+    val_data = pd.concat([switch_val, no_switch_val]).sample(frac=1, random_state=42).reset_index(drop=True)
+    test_data = pd.concat([switch_test, no_switch_test]).sample(frac=1, random_state=42).reset_index(drop=True)
+
+    # Save splits
+    train_data.to_csv('train_sequences.csv', index=False)
+    val_data.to_csv('val_sequences.csv', index=False)
+    test_data.to_csv('test_sequences.csv', index=False)
+
+    print(f"\n=== Stratified Train/Val/Test Split ===")
+    print(f"Training: {len(train_data)} sequences")
+    print(f"  With switches: {train_data['contains_switch'].sum()} ({train_data['contains_switch'].mean() * 100:.1f}%)")
+    print(f"Validation: {len(val_data)} sequences")
+    print(f"  With switches: {val_data['contains_switch'].sum()} ({val_data['contains_switch'].mean() * 100:.1f}%)")
+    print(f"Test: {len(test_data)} sequences")
+    print(f"  With switches: {test_data['contains_switch'].sum()} ({test_data['contains_switch'].mean() * 100:.1f}%)")
+
+    # Analyze label distribution
+    for split_name, split_data in [("Train", train_data), ("Val", val_data), ("Test", test_data)]:
+        label_counts = defaultdict(int)
+        total_switches = 0
+
+        for _, row in split_data.iterrows():
+            labels = list(map(int, row['labels'].split(',')))
+            for label in labels:
+                label_counts[label] += 1
+                if label > 0:
+                    total_switches += 1
+
+        print(f"\n{split_name} switch distribution:")
+        print(f"  Total switch labels: {total_switches}")
+        print(f"  To Auto (1): {label_counts[1]}")
+        print(f"  To Allo (2): {label_counts[2]}")
+
+    return train_data, val_data, test_data
+
+
+def evaluate_on_test_set_fixed(model, tokenizer, test_csv='test_sequences.csv', max_distance=10):
+    """
+    Fixed evaluation function without double-counting bug.
+    """
+    print("\n" + "=" * 60)
+    print("EVALUATING ON TEST SET")
+    print("=" * 60)
+
+    # Load test data
+    test_df = pd.read_csv(test_csv)
+    device = next(model.parameters()).device
+    model.eval()
+
+    # Initialize metrics
+    all_predictions = []
+    all_labels = []
+    detailed_results = []
+
+    # Process each test sequence
+    for idx, row in test_df.iterrows():
+        tokens = row['tokens'].split()
+        true_labels = list(map(int, row['labels'].split(',')))
+
+        # Tokenize
+        tokenizer_output = tokenizer(
+            tokens,
+            is_split_into_words=True,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+
+        # Get word alignment
+        word_ids = tokenizer_output.word_ids()
+        inputs = {k: v.to(device) for k, v in tokenizer_output.items()}
+
+        # Predict
+        with torch.no_grad():
+            outputs = model(**inputs)
+            predictions = torch.argmax(outputs.logits, dim=2)
+            probs = torch.softmax(outputs.logits, dim=2)
+
+        # Align predictions with original tokens
+        aligned_predictions = []
+        aligned_probs = []
+        previous_word_idx = None
+
+        for i, word_idx in enumerate(word_ids):
+            if word_idx is not None and word_idx != previous_word_idx:
+                pred = predictions[0][i].item()
+                aligned_predictions.append(pred)
+                aligned_probs.append(probs[0][i].cpu().numpy())
+            previous_word_idx = word_idx
+
+        # Trim to match token length - ONLY ONCE!
+        final_len = min(len(aligned_predictions), len(true_labels), len(tokens))
+        aligned_predictions = aligned_predictions[:final_len]
+        aligned_labels = true_labels[:final_len]
+
+        if final_len > 0:
+            all_predictions.extend(aligned_predictions)
+            all_labels.extend(aligned_labels)
+
+        # Store detailed results for this sequence
+        sequence_result = {
+            'sequence_idx': idx,
+            'tokens': tokens[:final_len],
+            'true_labels': aligned_labels,
+            'predictions': aligned_predictions,
+            'has_true_switches': any(l > 0 for l in aligned_labels),
+            'has_pred_switches': any(p > 0 for p in aligned_predictions)
+        }
+
+        # Find switches
+        true_switches = [(i, l) for i, l in enumerate(aligned_labels) if l > 0]
+        pred_switches = [(i, p) for i, p in enumerate(aligned_predictions) if p > 0]
+
+        sequence_result['true_switches'] = true_switches
+        sequence_result['pred_switches'] = pred_switches
+
+        detailed_results.append(sequence_result)
+
+    # Import ProximityAwareMetrics (assuming it's defined elsewhere)
+    # from proximity_aware_loss_fixed import ProximityAwareMetrics
+
+    # Convert to arrays
+    all_predictions_array = np.array(all_predictions)
+    all_labels_array = np.array(all_labels)
+
+    print(f"Total tokens processed: {len(all_predictions_array)}")
+
+    # Compute metrics
+    metrics_calculator = ProximityAwareMetrics(max_distance=max_distance)
+    proximity_metrics = metrics_calculator.compute_proximity_metrics(
+        all_predictions_array,
+        all_labels_array
+    )
+
+    # Print results
+    print("\n=== Overall Test Metrics ===")
+    print(f"Total test tokens: {len(all_labels_array)}")
+    print(f"Accuracy: {proximity_metrics['accuracy']:.3f}")
+    print(f"\nProximity-aware metrics:")
+    print(f"  F1 Score: {proximity_metrics['proximity_f1']:.3f}")
+    print(f"  Precision: {proximity_metrics['proximity_precision']:.3f}")
+    print(f"  Recall: {proximity_metrics['proximity_recall']:.3f}")
+
+    print(f"\n=== Switch Detection Performance ===")
+    print(f"Total true switches: {proximity_metrics['total_true_switches']}")
+    print(f"Total predicted switches: {proximity_metrics['total_pred_switches']}")
+    print(f"Exact matches: {proximity_metrics['exact_switch_matches']}")
+
+    # Show distance breakdown
+    print("\nDistance breakdown:")
+    for dist in range(1, max_distance + 1):
+        matches = proximity_metrics['proximity_matches'].get(dist, 0)
+        print(f"  {dist} word{'s' if dist > 1 else ''} off: {matches}")
+
+    print(f"\nMissed switches: {proximity_metrics['missed_switches']}")
+    print(f"False switches: {proximity_metrics['false_switches']}")
+
+    # Per-class performance
+    if proximity_metrics['total_true_switches'] > 10:  # Only show if enough examples
+        from sklearn.metrics import classification_report
+        print("\n=== Per-Class Performance ===")
+        print(classification_report(
+            all_labels_array,
+            all_predictions_array,
+            labels=[0, 1, 2],
+            target_names=['No Switch', 'To Auto', 'To Allo'],
+            digits=3,
+            zero_division=0
+        ))
+
+    # Show examples with switches
+    print("\n=== Example Predictions ===")
+    examples_shown = 0
+    for result in detailed_results:
+        if result['has_true_switches'] and examples_shown < 5:
+            print(f"\nExample {examples_shown + 1}:")
+            print(f"Tokens (first 30): {' '.join(result['tokens'][:30])}...")
+            print(f"True switches: {result['true_switches'][:5]}")
+            print(f"Predicted switches: {result['pred_switches'][:5]}")
+            examples_shown += 1
+
+    # Save results
+    results_summary = {
+        'overall_metrics': proximity_metrics,
+        'total_sequences': len(test_df),
+        'sequences_with_true_switches': sum(1 for r in detailed_results if r['has_true_switches']),
+        'sequences_with_pred_switches': sum(1 for r in detailed_results if r['has_pred_switches'])
+    }
+
+    with open('test_results_fixed.json', 'w') as f:
+        json.dump(results_summary, f, indent=2)
+
+    print(f"\nDetailed results saved to test_results_fixed.json")
+
+    return proximity_metrics, detailed_results
+
+
+def augment_training_data(train_csv='train_sequences.csv', augmentation_factor=2):
+    """
+    Augment training data to balance switch vs no-switch sequences.
+    """
+    train_df = pd.read_csv(train_csv)
+
+    # Analyze current distribution
+    switch_sequences = train_df[train_df['contains_switch'] == 1]
+    no_switch_sequences = train_df[train_df['contains_switch'] == 0]
+
+    print(f"\nOriginal training data:")
+    print(f"  With switches: {len(switch_sequences)}")
+    print(f"  Without switches: {len(no_switch_sequences)}")
+
+    # Duplicate sequences with switches
+    augmented_switch_sequences = pd.concat([switch_sequences] * augmentation_factor)
+
+    # Combine with a subset of no-switch sequences for balance
+    # Keep ratio around 1:3 (switch:no-switch)
+    n_no_switch_to_keep = min(len(no_switch_sequences), len(augmented_switch_sequences) * 3)
+    balanced_no_switch = no_switch_sequences.sample(n=n_no_switch_to_keep, random_state=42)
+
+    # Combine and shuffle
+    augmented_train = pd.concat([augmented_switch_sequences, balanced_no_switch])
+    augmented_train = augmented_train.sample(frac=1, random_state=42).reset_index(drop=True)
+
+    # Save augmented data
+    augmented_train.to_csv('train_sequences_augmented.csv', index=False)
+
+    print(f"\nAugmented training data:")
+    print(f"  Total sequences: {len(augmented_train)}")
+    print(
+        f"  With switches: {augmented_train['contains_switch'].sum()} ({augmented_train['contains_switch'].mean() * 100:.1f}%)")
+
+    return augmented_train
+
+
 def train_and_evaluate_full_pipeline():
     """Complete pipeline: process data, split, train, and evaluate on test set."""
 
@@ -740,51 +1162,32 @@ def train_and_evaluate_full_pipeline():
         sequence_length=512
     )
 
-    # Step 2: Create train/val/test split
-    print("\nStep 2: Creating train/val/test split...")
-    train_df, val_df, test_df = prepare_for_bert_training_with_test(
+    # Step 2: Create STRATIFIED train/val/test split
+    print("\nStep 2: Creating stratified train/val/test split...")
+    train_df, val_df, test_df = stratified_split_for_sequences(
         'classify_allo_auto/data/sequences_3class.csv',
-        train_ratio=0.8,
-        val_ratio=0.1,
-        test_ratio=0.1
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15
     )
 
-    # In your train_and_evaluate_full_pipeline function, after creating the splits:
+    # Step 3: Augment training data (optional but recommended)
+    print("\nStep 3: Augmenting training data...")
+    augmented_train = augment_training_data(
+        'train_sequences.csv',
+        augmentation_factor=3  # Triplicate switch sequences
+    )
 
-    # Load the training data
-    train_df = pd.read_csv('train_sequences.csv')
-
-    # Remove sequences with 0 switches
-    train_df_filtered = train_df[train_df['num_switches'] > 0]
-    print(f"\nRemoved {len(train_df) - len(train_df_filtered)} sequences with no switches")
-
-    # Optional: Further boost sequences with many switches
-    # Create multiple copies of sequences with 10+ switches
-    high_switch_sequences = train_df_filtered[train_df_filtered['num_switches'] >= 10]
-    if len(high_switch_sequences) > 0:
-        # Add 2 more copies of high-switch sequences
-        train_df_filtered = pd.concat([
-            train_df_filtered,
-            high_switch_sequences,
-            high_switch_sequences
-        ])
-
-    # Save the filtered data
-    train_df_filtered.to_csv('train_sequences.csv', index=False)
-
-    # Then create your dataset with this filtered data
-
-
-    # Step 3: Train the model
-    print("\nStep 3: Training model...")
+    # Step 4: Initialize model and tokenizer
+    print("\nStep 4: Initializing model and tokenizer...")
     model_name = 'OMRIDRORI/mbert-tibetan-continual-unicode-240k'
     # model_name = 'bert-base-multilingual-cased'
-    output_dir = './proximity_cs_model_with_test'
+    output_dir = './classify_allo_auto/proximity_cs_model_with_test'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Initialize tokenizer and model
+    # Initialize tokenizer and model FIRST
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForTokenClassification.from_pretrained(
         model_name,
@@ -794,14 +1197,16 @@ def train_and_evaluate_full_pipeline():
     )
     model = model.to(device)
 
-    # Create datasets
-    # train_dataset = CodeSwitchingDataset('train_sequences.csv', tokenizer)
-    train_dataset = CodeSwitchingDataset('train_sequences.csv', tokenizer)
-
+    # Step 5: Create datasets AFTER tokenizer is initialized
+    print("\nStep 5: Creating datasets...")
+    train_dataset = CodeSwitchingDataset('train_sequences_augmented.csv', tokenizer)
     val_dataset = CodeSwitchingDataset('val_sequences.csv', tokenizer)
 
     # Data collator
     data_collator = DataCollatorForTokenClassification(tokenizer)
+
+    # Step 6: Set up training
+    print("\nStep 6: Setting up training...")
 
     # Training arguments
     training_args = TrainingArguments(
@@ -830,7 +1235,7 @@ def train_and_evaluate_full_pipeline():
     def compute_metrics(eval_pred):
         return compute_metrics_with_proximity(eval_pred, max_distance=10)
 
-    # Initialize trainer
+    # Initialize trainer with higher switch_loss_weight for imbalanced data
     trainer = ProximityAwareTrainer(
         model=model,
         args=training_args,
@@ -841,23 +1246,20 @@ def train_and_evaluate_full_pipeline():
         compute_metrics=compute_metrics,
         max_distance=10,
         distance_weights=[1.0, 0.99, 0.95, 0.9, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55],
-        # distance_weights=[1.0, 0.85, 0.7, 0.55, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1],
-        switch_loss_weight=5
-        # switch_loss_weight=20.0
+        switch_loss_weight=15  # Increased from 5 to help with imbalanced data
     )
 
-
-    # Train
-    print("\nStarting training with proximity-aware loss...")
+    # Step 7: Train
+    print("\nStep 7: Starting training with proximity-aware loss...")
     trainer.train()
 
     # Save the model
     trainer.save_model(f'{output_dir}/final_model')
     tokenizer.save_pretrained(f'{output_dir}/final_model')
 
-    # Step 4: Evaluate on test set
-    print("\nStep 4: Evaluating on test set...")
-    test_metrics, test_results = evaluate_on_test_set(
+    # Step 8: Evaluate on test set with fixed evaluation
+    print("\nStep 8: Evaluating on test set...")
+    test_metrics, test_results = evaluate_on_test_set_fixed(
         model,
         tokenizer,
         'test_sequences.csv',
@@ -869,11 +1271,24 @@ def train_and_evaluate_full_pipeline():
     print("=" * 60)
     print(f"\nModel saved to: {output_dir}/final_model")
     print(f"Test F1 Score: {test_metrics['proximity_f1']:.3f}")
+
+    # Additional diagnostic information
+    if test_metrics['proximity_f1'] < 0.1:
+        print("\n⚠️ WARNING: Very low F1 score detected!")
+        print("Possible causes:")
+        print("1. Severe class imbalance - consider more aggressive augmentation")
+        print("2. Model not learning to detect switches - try increasing switch_loss_weight to 20-30")
+        print("3. Data quality issues - verify your labeled data")
+        print("\nRecommendations:")
+        print("- Check if model is predicting any switches at all during training")
+        print("- Monitor training loss to ensure it's decreasing")
+        print("- Consider using focal loss instead of weighted cross-entropy")
+
     import ipdb
     ipdb.set_trace()
 
     return trainer, model, tokenizer, test_metrics
 
-
 if __name__ == "__main__":
+    # train_and_evaluate_full_pipeline_fixed()
     train_and_evaluate_full_pipeline()
