@@ -35,7 +35,7 @@ class ProximityAwareLoss(nn.Module):
     """
     
     def __init__(self, max_distance=10, distance_weights=None, class_weights=None,
-                 switch_loss_weight=10.0, proximity_bonus=True):
+                 switch_loss_weight=10.0, proximity_bonus=True, false_positive_penalty=2):
         """
         Args:
             max_distance: Maximum distance (in tokens) to consider for partial credit
@@ -50,7 +50,9 @@ class ProximityAwareLoss(nn.Module):
         # Default distance weights: exponential decay
         if distance_weights is None:
             # self.distance_weights = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.1])
-            self.distance_weights = torch.tensor([1.0, 0.85, 0.7, 0.55, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1])
+            # self.distance_weights = torch.tensor([1.0, 0.85, 0.7, 0.55, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1])
+            self.distance_weights = torch.tensor([1.0, 0.99, 0.95, 0.9, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55])
+
 
         else:
             self.distance_weights = torch.tensor(distance_weights)
@@ -62,6 +64,7 @@ class ProximityAwareLoss(nn.Module):
             self.class_weights = torch.tensor(class_weights)
             
         self.proximity_bonus = proximity_bonus
+        self.false_positive_penalty = false_positive_penalty
         
     def forward(self, logits, labels):
         """
@@ -139,7 +142,14 @@ class ProximityAwareLoss(nn.Module):
         
         # Apply valid mask and compute mean
         masked_loss = ce_loss * valid_mask
-        loss = masked_loss.sum() / valid_mask.sum().clamp(min=1)
+
+        # Add false positive penalty
+        false_positive_mask = (pred_switch_mask * (1 - switch_mask)) * valid_mask
+        false_positive_penalty = false_positive_mask * self.false_positive_penalty
+
+        # Combine losses and compute scalar mean
+        total_loss = masked_loss + false_positive_penalty
+        loss = total_loss.sum() / valid_mask.sum().clamp(min=1)
         
         return loss
 
@@ -734,14 +744,41 @@ def train_and_evaluate_full_pipeline():
     print("\nStep 2: Creating train/val/test split...")
     train_df, val_df, test_df = prepare_for_bert_training_with_test(
         'classify_allo_auto/data/sequences_3class.csv',
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15
+        train_ratio=0.8,
+        val_ratio=0.1,
+        test_ratio=0.1
     )
+
+    # In your train_and_evaluate_full_pipeline function, after creating the splits:
+
+    # Load the training data
+    train_df = pd.read_csv('train_sequences.csv')
+
+    # Remove sequences with 0 switches
+    train_df_filtered = train_df[train_df['num_switches'] > 0]
+    print(f"\nRemoved {len(train_df) - len(train_df_filtered)} sequences with no switches")
+
+    # Optional: Further boost sequences with many switches
+    # Create multiple copies of sequences with 10+ switches
+    high_switch_sequences = train_df_filtered[train_df_filtered['num_switches'] >= 10]
+    if len(high_switch_sequences) > 0:
+        # Add 2 more copies of high-switch sequences
+        train_df_filtered = pd.concat([
+            train_df_filtered,
+            high_switch_sequences,
+            high_switch_sequences
+        ])
+
+    # Save the filtered data
+    train_df_filtered.to_csv('train_sequences.csv', index=False)
+
+    # Then create your dataset with this filtered data
+
 
     # Step 3: Train the model
     print("\nStep 3: Training model...")
-    model_name = 'bert-base-multilingual-cased'
+    model_name = 'OMRIDRORI/mbert-tibetan-continual-unicode-240k'
+    # model_name = 'bert-base-multilingual-cased'
     output_dir = './proximity_cs_model_with_test'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -758,7 +795,9 @@ def train_and_evaluate_full_pipeline():
     model = model.to(device)
 
     # Create datasets
+    # train_dataset = CodeSwitchingDataset('train_sequences.csv', tokenizer)
     train_dataset = CodeSwitchingDataset('train_sequences.csv', tokenizer)
+
     val_dataset = CodeSwitchingDataset('val_sequences.csv', tokenizer)
 
     # Data collator
@@ -774,7 +813,7 @@ def train_and_evaluate_full_pipeline():
         learning_rate=3e-5,
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
-        num_train_epochs=10,
+        num_train_epochs=25,
         weight_decay=0.01,
         logging_dir=f'{output_dir}/logs',
         logging_steps=20,
@@ -782,7 +821,7 @@ def train_and_evaluate_full_pipeline():
         metric_for_best_model='proximity_f1',
         greater_is_better=True,
         warmup_steps=500,
-        save_total_limit=3,
+        save_total_limit=1,
         gradient_accumulation_steps=2,
         fp16=torch.cuda.is_available(),
     )
@@ -801,9 +840,12 @@ def train_and_evaluate_full_pipeline():
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
         max_distance=10,
-        distance_weights=[1.0, 0.85, 0.7, 0.55, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1],
-        switch_loss_weight=20.0
+        distance_weights=[1.0, 0.99, 0.95, 0.9, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55],
+        # distance_weights=[1.0, 0.85, 0.7, 0.55, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1],
+        switch_loss_weight=5
+        # switch_loss_weight=20.0
     )
+
 
     # Train
     print("\nStarting training with proximity-aware loss...")
