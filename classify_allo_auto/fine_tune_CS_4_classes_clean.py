@@ -1208,8 +1208,10 @@ def train_tibetan_code_switching():
 
     # Step 3: Initialize model with better configuration
     print("\nSTEP 3: Initializing model...")
+    # model_name = 'bert-base-multilingual-cased'
     model_name = 'OMRIDRORI/mbert-tibetan-continual-wylie-final'
-    output_dir = './tibetan_code_switching_constrained_model'
+    # output_dir = './tibetan_code_switching_constrained_model_bert-base-multilingual-cased'
+    output_dir = './tibetan_code_switching_constrained_model_wylie-final_all_data'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1297,7 +1299,8 @@ def train_tibetan_code_switching():
         label_smoothing_factor=0.05,  # Reduced smoothing
         gradient_checkpointing=True,
         push_to_hub=True,  # Enable pushing to HF
-        hub_model_id="levshechter/tibetan-CS-detector",  # Your HF repo
+        # hub_model_id="levshechter/tibetan-CS-detesctor_bert-base-multilingual-cased",  # Your HF repo
+        hub_model_id="levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data",  # Your HF repo
     )
 
     # Custom trainer with logical constraints
