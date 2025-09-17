@@ -465,6 +465,7 @@ class ProximityAwareLoss4Class(nn.Module):
         total_loss = (ce_loss + false_positive_penalty) * valid_mask
         loss = total_loss.sum() / valid_mask.sum().clamp(min=1)
 
+
         return loss
 
 
