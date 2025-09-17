@@ -81,7 +81,7 @@ def main():
     """Main function to process all files in the corpus directory."""
 
     corpus_dir = "/home/guyb/hackathon-alloauto/bjornpixel/Sungbum_flat_shortened_test"
-    output_dir = "/home/guyb/hackathon-alloauto/bjornpixel/per_line_output"
+    output_dir = "/home/guyb/hackathon-alloauto/bjornpixel/per_line_step_1_output"
 
     if not os.path.exists(corpus_dir):
         print(f"Error: Directory {corpus_dir} not found!")

@@ -236,8 +236,8 @@ def print_statistics(output_dir: str):
 
 
 if __name__ == "__main__":
-    input_directory = "/home/guyb/hackathon-alloauto/bjornpixel/step1_output"
-    output_directory = "/home/guyb/hackathon-alloauto/bjornpixel/step3_output"
+    input_directory = "/home/guyb/hackathon-alloauto/bjornpixel/per_line_step_1_output"
+    output_directory = "/home/guyb/hackathon-alloauto/bjornpixel/per_line_step_3_output"
 
     analyze_verse_matches(input_directory, output_directory, verbose=True)
     print_statistics(output_directory)
