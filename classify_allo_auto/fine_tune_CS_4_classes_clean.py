@@ -6,7 +6,7 @@ Classes:
   2: Switch TO Auto
   3: Switch TO Allo
 
-Focus: Creating segments with transitions, sentence-based boundaries
+Focus: Proximity-aware loss and evaluation with 5-token tolerance
 """
 
 import torch
@@ -55,7 +55,7 @@ def clean_and_normalize_text(text_content):
     for line in lines:
         line = line.strip()
 
-        # Skip empty lines and separator lines (lines with only dashes, underscores, etc.)
+        # Skip empty lines and separator lines
         if not line or re.match(r'^[-_=\s]+$', line):
             continue
 
@@ -81,7 +81,6 @@ def split_into_sentences(text_content):
     """
     Split text into sentences based on . / // boundaries
     """
-    # Split on sentence boundaries while preserving the tags
     sentences = []
     current_sentence = ""
 
@@ -105,29 +104,62 @@ def split_into_sentences(text_content):
     return [s for s in sentences if s.strip()]
 
 
-def extract_segments_with_transitions(sentences, max_sentences_per_segment=3):
+def extract_segments_with_token_limit(sentences, min_tokens=300, max_tokens=400):
     """
-    Extract segments that contain transitions between allo and auto
+    Extract segments of 300-400 tokens, trying to respect sentence boundaries
     """
     segments = []
+    current_segment = []
+    current_token_count = 0
 
-    # Process sentences in overlapping windows
-    for i in range(len(sentences)):
-        for window_size in range(1, min(max_sentences_per_segment + 1, len(sentences) - i + 1)):
-            segment_sentences = sentences[i:i + window_size]
-            segment_text = ' '.join(segment_sentences)
+    for sentence in sentences:
+        # Count tokens in this sentence (simple whitespace tokenization for now)
+        sentence_tokens = sentence.split()
+        sentence_token_count = len(sentence_tokens)
 
-            # Check if this segment contains both <auto> and <allo> tags (transition)
-            has_auto = '<auto>' in segment_text
-            has_allo = '<allo>' in segment_text
+        # If adding this sentence would exceed max_tokens
+        if current_token_count + sentence_token_count > max_tokens:
+            # Save current segment if it meets minimum
+            if current_token_count >= min_tokens:
+                segment_text = ' '.join(current_segment)
+                # Check if segment contains switches
+                if '<auto>' in segment_text and '<allo>' in segment_text:
+                    segments.append({
+                        'text': segment_text,
+                        'token_count': current_token_count,
+                        'has_transition': True
+                    })
+            # Start new segment with current sentence
+            current_segment = [sentence]
+            current_token_count = sentence_token_count
+        else:
+            # Add sentence to current segment
+            current_segment.append(sentence)
+            current_token_count += sentence_token_count
 
-            if has_auto and has_allo:
-                # This segment contains a transition
-                segments.append({
-                    'text': segment_text,
-                    'sentence_indices': list(range(i, i + window_size)),
-                    'has_transition': True
-                })
+            # Check if we've reached the target range
+            if current_token_count >= min_tokens:
+                segment_text = ' '.join(current_segment)
+                # Only keep if it has transitions
+                if '<auto>' in segment_text and '<allo>' in segment_text:
+                    segments.append({
+                        'text': segment_text,
+                        'token_count': current_token_count,
+                        'has_transition': True
+                    })
+                # Start new segment
+                current_segment = []
+                current_token_count = 0
+
+    # Handle remaining sentences
+    if current_segment and current_token_count >= min_tokens // 2:  # Be lenient for last segment
+        segment_text = ' '.join(current_segment)
+        if '<auto>' in segment_text and '<allo>' in segment_text:
+            segments.append({
+                'text': segment_text,
+                'token_count': current_token_count,
+                'has_transition': True
+            })
 
     return segments
 
@@ -214,9 +246,9 @@ def process_file_to_segments(file_path, file_type):
     sentences = split_into_sentences(text_content)
     print(f"  Found {len(sentences)} sentences")
 
-    # Extract segments with transitions
-    segments = extract_segments_with_transitions(sentences, max_sentences_per_segment=3)
-    print(f"  Found {len(segments)} segments with transitions")
+    # Extract segments with token limit (300-400 tokens)
+    segments = extract_segments_with_token_limit(sentences, min_tokens=300, max_tokens=400)
+    print(f"  Found {len(segments)} segments with transitions (300-400 tokens each)")
 
     # Convert segments to token-label pairs
     processed_segments = []
@@ -290,6 +322,7 @@ def process_all_files(data_dir):
     print(f"\n=== Dataset Statistics ===")
     print(f"Total segments: {len(df)}")
     print(f"Total tokens: {df['num_tokens'].sum()}")
+    print(f"Average tokens per segment: {df['num_tokens'].mean():.1f}")
     print(f"Total transitions: {df['num_transitions'].sum()}")
     print(f"Files represented: {df['source_file'].nunique()}")
 
@@ -310,41 +343,55 @@ def process_all_files(data_dir):
 
 def create_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
     """
-    Create stratified split ensuring file diversity and proper shuffling
+    Create stratified split ensuring file diversity and no data leakage
     """
     print(f"\n=== Creating Train/Val/Test Split ===")
 
-    # Group by source file
+    # Group by source file to prevent leakage
     file_groups = {}
     for file_name in df['source_file'].unique():
         file_data = df[df['source_file'] == file_name].copy()
         file_groups[file_name] = file_data
 
+    # Assign entire files to splits to ensure diversity
+    files = list(file_groups.keys())
+    np.random.seed(42)
+    np.random.shuffle(files)
+
+    n_files = len(files)
+    n_train_files = int(n_files * 0.6)  # 60% of files for training
+    n_val_files = int(n_files * 0.2)    # 20% of files for validation
+
+    train_files = files[:n_train_files]
+    val_files = files[n_train_files:n_train_files + n_val_files]
+    test_files = files[n_train_files + n_val_files:]
+
+    # Now split segments within each file group
     train_dfs = []
     val_dfs = []
     test_dfs = []
 
-    # Split each file's data to ensure all splits have data from all files
     for file_name, file_data in file_groups.items():
-        n = len(file_data)
-        n_train = int(n * train_ratio)
-        n_val = int(n * val_ratio)
-
-        # Shuffle within file
+        # Shuffle segments within file
         file_data = file_data.sample(frac=1, random_state=42).reset_index(drop=True)
 
-        train_data = file_data.iloc[:n_train]
-        val_data = file_data.iloc[n_train:n_train + n_val]
-        test_data = file_data.iloc[n_train + n_val:]
+        if file_name in train_files:
+            # Most segments go to train, some to val for diversity
+            n = len(file_data)
+            n_train = int(n * 0.85)
+            train_dfs.append(file_data.iloc[:n_train])
+            val_dfs.append(file_data.iloc[n_train:])
 
-        if len(train_data) > 0:
-            train_dfs.append(train_data)
-        if len(val_data) > 0:
-            val_dfs.append(val_data)
-        if len(test_data) > 0:
-            test_dfs.append(test_data)
+        elif file_name in val_files:
+            # Most segments go to val, some to train for diversity
+            n = len(file_data)
+            n_val = int(n * 0.85)
+            val_dfs.append(file_data.iloc[:n_val])
+            train_dfs.append(file_data.iloc[n_val:])
 
-        print(f"  {file_name}: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
+        else:  # test_files
+            # All segments go to test (no leakage)
+            test_dfs.append(file_data)
 
     # Combine and shuffle across files
     train_df = pd.concat(train_dfs, ignore_index=True).sample(frac=1, random_state=42).reset_index(drop=True)
@@ -360,6 +407,14 @@ def create_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15, test_ratio=
     print(f"  Training: {len(train_df)} segments from {train_df['source_file'].nunique()} files")
     print(f"  Validation: {len(val_df)} segments from {val_df['source_file'].nunique()} files")
     print(f"  Test: {len(test_df)} segments from {test_df['source_file'].nunique()} files")
+
+    print(f"\nNo leakage check:")
+    train_files_set = set(train_df['source_file'].unique())
+    test_files_set = set(test_df['source_file'].unique())
+    overlap = train_files_set.intersection(test_files_set)
+    print(f"  Files appearing in both train and test: {len(overlap)}")
+    if overlap:
+        print(f"  Warning: Some files appear in both splits: {overlap}")
 
     return train_df, val_df, test_df
 
@@ -419,16 +474,22 @@ class CodeSwitchingDataset4Class(Dataset):
 
 
 # ============================================================================
-# PART 3: LOSS FUNCTION
+# PART 3: PROXIMITY-AWARE LOSS FUNCTION
 # ============================================================================
 
 class ProximityAwareLoss4Class(nn.Module):
-    """Loss function for 4-class code-switching with proximity awareness."""
+    """
+    Loss function that allows predicted switches to be within tolerance distance
+    BUT requires matching switch types (auto->allo vs allo->auto)
+    """
 
-    def __init__(self, switch_loss_weight=20.0, false_positive_penalty=5.0):
+    def __init__(self, switch_loss_weight=20.0, proximity_tolerance=5, distance_decay=0.8):
         super().__init__()
+        self.switch_loss_weight = switch_loss_weight
+        self.proximity_tolerance = proximity_tolerance
+        self.distance_decay = distance_decay
 
-        # Higher weights for switch classes since they're rare but important
+        # Base class weights
         self.class_weights = torch.tensor([
             1.0,  # Class 0: Non-switch auto
             1.0,  # Class 1: Non-switch allo
@@ -436,15 +497,12 @@ class ProximityAwareLoss4Class(nn.Module):
             switch_loss_weight   # Class 3: Switch to allo
         ])
 
-        self.false_positive_penalty = false_positive_penalty
-
     def forward(self, logits, labels):
         batch_size, seq_len, num_classes = logits.shape
         device = logits.device
-
         self.class_weights = self.class_weights.to(device)
 
-        # Cross-entropy loss with class weights
+        # Standard cross-entropy loss
         ce_loss = F.cross_entropy(
             logits.view(-1, num_classes),
             labels.view(-1),
@@ -454,62 +512,197 @@ class ProximityAwareLoss4Class(nn.Module):
 
         valid_mask = (labels != -100).float()
 
-        # Additional penalty for false positives on switch classes
+        # Get predictions
         predictions = torch.argmax(logits, dim=-1)
-        switch_mask = ((labels == 2) | (labels == 3)).float()
-        pred_switch_mask = ((predictions == 2) | (predictions == 3)).float()
 
-        false_positive_mask = (pred_switch_mask * (1 - switch_mask)) * valid_mask
-        false_positive_penalty = false_positive_mask * self.false_positive_penalty
+        # Apply proximity-aware adjustments for switch predictions
+        proximity_adjusted_loss = ce_loss.clone()
 
-        total_loss = (ce_loss + false_positive_penalty) * valid_mask
+        for b in range(batch_size):
+            # Find true switch positions BY TYPE
+            true_switches_to_auto = torch.where(labels[b] == 2)[0]
+            true_switches_to_allo = torch.where(labels[b] == 3)[0]
+            pred_switches_to_auto = torch.where(predictions[b] == 2)[0]
+            pred_switches_to_allo = torch.where(predictions[b] == 3)[0]
+
+            # For each predicted "switch to auto", check proximity to true "switch to auto"
+            for pred_pos in pred_switches_to_auto:
+                pred_class = predictions[b, pred_pos].item()
+                if len(true_switches_to_auto) > 0:
+                    # Find minimum distance to SAME TYPE of switch
+                    distances = torch.abs(true_switches_to_auto - pred_pos)
+                    min_distance = torch.min(distances).item()
+
+                    if 0 < min_distance <= self.proximity_tolerance:
+                        # Reduce loss based on proximity (closer = less penalty)
+                        decay_factor = self.distance_decay ** min_distance
+                        proximity_adjusted_loss[b, pred_pos] *= decay_factor
+                # If no matching true switches nearby, keep full penalty
+
+            # For each predicted "switch to allo", check proximity to true "switch to allo"
+            for pred_pos in pred_switches_to_allo:
+                if len(true_switches_to_allo) > 0:
+                    # Find minimum distance to SAME TYPE of switch
+                    distances = torch.abs(true_switches_to_allo - pred_pos)
+                    min_distance = torch.min(distances).item()
+
+                    if 0 < min_distance <= self.proximity_tolerance:
+                        # Reduce loss based on proximity (closer = less penalty)
+                        decay_factor = self.distance_decay ** min_distance
+                        proximity_adjusted_loss[b, pred_pos] *= decay_factor
+                # If no matching true switches nearby, keep full penalty
+
+            # For false negatives (missed switches), add penalty
+            # Check "switch to auto" misses
+            for true_pos in true_switches_to_auto:
+                if len(pred_switches_to_auto) == 0:
+                    # No predictions of this type at all - full penalty
+                    proximity_adjusted_loss[b, true_pos] *= 2.0
+                else:
+                    # Check if any prediction of SAME TYPE is close
+                    distances = torch.abs(pred_switches_to_auto - true_pos)
+                    min_distance = torch.min(distances).item()
+
+                    if min_distance > self.proximity_tolerance:
+                        # No nearby prediction of same type - add penalty
+                        proximity_adjusted_loss[b, true_pos] *= 1.5
+
+            # Check "switch to allo" misses
+            for true_pos in true_switches_to_allo:
+                if len(pred_switches_to_allo) == 0:
+                    # No predictions of this type at all - full penalty
+                    proximity_adjusted_loss[b, true_pos] *= 2.0
+                else:
+                    # Check if any prediction of SAME TYPE is close
+                    distances = torch.abs(pred_switches_to_allo - true_pos)
+                    min_distance = torch.min(distances).item()
+
+                    if min_distance > self.proximity_tolerance:
+                        # No nearby prediction of same type - add penalty
+                        proximity_adjusted_loss[b, true_pos] *= 1.5
+
+        # Apply valid mask and compute mean
+        total_loss = proximity_adjusted_loss * valid_mask
         loss = total_loss.sum() / valid_mask.sum().clamp(min=1)
-
 
         return loss
 
 
 # ============================================================================
-# PART 4: METRICS AND EVALUATION
+# PART 4: PROXIMITY-AWARE METRICS
 # ============================================================================
 
-def compute_switch_metrics(predictions, labels):
-    """Compute metrics focusing on switch detection"""
-    mask = labels != -100
-    predictions = predictions[mask]
-    labels = labels[mask]
+def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance=5):
+    """
+    Evaluate switch detection with proximity tolerance and TYPE matching
+    Switch types must match: class 2 with class 2, class 3 with class 3
+    """
+    true_labels = np.array(true_labels)
+    pred_labels = np.array(pred_labels)
 
-    # Basic accuracy
-    accuracy = (predictions == labels).mean()
+    # Find switch positions BY TYPE
+    true_switches_to_auto = np.where(true_labels == 2)[0]  # Switch to Auto
+    true_switches_to_allo = np.where(true_labels == 3)[0]  # Switch to Allo
+    pred_switches_to_auto = np.where(pred_labels == 2)[0]  # Predicted Switch to Auto
+    pred_switches_to_allo = np.where(pred_labels == 3)[0]  # Predicted Switch to Allo
 
-    # Switch detection metrics
-    true_switches = (labels == 2) | (labels == 3)
-    pred_switches = (predictions == 2) | (predictions == 3)
+    # Track matches separately by type
+    matched_true_to_auto = set()
+    matched_pred_to_auto = set()
+    matched_true_to_allo = set()
+    matched_pred_to_allo = set()
 
-    # True positives, false positives, false negatives
-    tp = (true_switches & pred_switches).sum()
-    fp = (~true_switches & pred_switches).sum()
-    fn = (true_switches & ~pred_switches).sum()
+    exact_matches = 0
+    proximity_matches = 0
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    # Match "Switch to Auto" predictions with "Switch to Auto" ground truth
+    for pred_pos in pred_switches_to_auto:
+        if len(true_switches_to_auto) > 0:
+            distances = np.abs(true_switches_to_auto - pred_pos)
+            min_distance = np.min(distances)
+            closest_true_idx = np.argmin(distances)
+            closest_true_pos = true_switches_to_auto[closest_true_idx]
+
+            # Only count if not already matched
+            if closest_true_pos not in matched_true_to_auto:
+                if min_distance == 0:
+                    exact_matches += 1
+                    matched_true_to_auto.add(closest_true_pos)
+                    matched_pred_to_auto.add(pred_pos)
+                elif min_distance <= tolerance:
+                    proximity_matches += 1
+                    matched_true_to_auto.add(closest_true_pos)
+                    matched_pred_to_auto.add(pred_pos)
+
+    # Match "Switch to Allo" predictions with "Switch to Allo" ground truth
+    for pred_pos in pred_switches_to_allo:
+        if len(true_switches_to_allo) > 0:
+            distances = np.abs(true_switches_to_allo - pred_pos)
+            min_distance = np.min(distances)
+            closest_true_idx = np.argmin(distances)
+            closest_true_pos = true_switches_to_allo[closest_true_idx]
+
+            # Only count if not already matched
+            if closest_true_pos not in matched_true_to_allo:
+                if min_distance == 0:
+                    exact_matches += 1
+                    matched_true_to_allo.add(closest_true_pos)
+                    matched_pred_to_allo.add(pred_pos)
+                elif min_distance <= tolerance:
+                    proximity_matches += 1
+                    matched_true_to_allo.add(closest_true_pos)
+                    matched_pred_to_allo.add(pred_pos)
+
+    # Total counts
+    total_true_switches = len(true_switches_to_auto) + len(true_switches_to_allo)
+    total_pred_switches = len(pred_switches_to_auto) + len(pred_switches_to_allo)
+    total_matched_true = len(matched_true_to_auto) + len(matched_true_to_allo)
+    total_matched_pred = len(matched_pred_to_auto) + len(matched_pred_to_allo)
+
+    total_matches = exact_matches + proximity_matches
+    missed_switches = total_true_switches - total_matched_true
+    false_switches = total_pred_switches - total_matched_pred
+
+    # Calculate metrics
+    precision = total_matches / total_pred_switches if total_pred_switches > 0 else 0
+    recall = total_matches / total_true_switches if total_true_switches > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
+    # Also calculate per-type metrics
+    to_auto_precision = len(matched_pred_to_auto) / len(pred_switches_to_auto) if len(pred_switches_to_auto) > 0 else 0
+    to_auto_recall = len(matched_true_to_auto) / len(true_switches_to_auto) if len(true_switches_to_auto) > 0 else 0
+    to_allo_precision = len(matched_pred_to_allo) / len(pred_switches_to_allo) if len(pred_switches_to_allo) > 0 else 0
+    to_allo_recall = len(matched_true_to_allo) / len(true_switches_to_allo) if len(true_switches_to_allo) > 0 else 0
+
     return {
-        'accuracy': float(accuracy),
-        'switch_precision': float(precision),
-        'switch_recall': float(recall),
-        'switch_f1': float(f1),
-        'true_switches': int(true_switches.sum()),
-        'pred_switches': int(pred_switches.sum()),
-        'tp': int(tp),
-        'fp': int(fp),
-        'fn': int(fn)
+        'exact_matches': exact_matches,
+        'proximity_matches': proximity_matches,
+        'total_matches': total_matches,
+        'true_switches': total_true_switches,
+        'pred_switches': total_pred_switches,
+        'missed_switches': missed_switches,
+        'false_switches': false_switches,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        # Per-type metrics
+        'true_to_auto': len(true_switches_to_auto),
+        'true_to_allo': len(true_switches_to_allo),
+        'pred_to_auto': len(pred_switches_to_auto),
+        'pred_to_allo': len(pred_switches_to_allo),
+        'matched_to_auto': len(matched_true_to_auto),
+        'matched_to_allo': len(matched_true_to_allo),
+        'to_auto_precision': to_auto_precision,
+        'to_auto_recall': to_auto_recall,
+        'to_allo_precision': to_allo_precision,
+        'to_allo_recall': to_allo_recall
     }
 
 
-def compute_metrics_for_trainer(eval_pred):
-    """Compute metrics for the trainer"""
+def compute_metrics_for_trainer(eval_pred, tolerance=5):
+    """
+    Compute metrics for the trainer with proximity awareness and TYPE matching
+    """
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=2)
 
@@ -517,25 +710,62 @@ def compute_metrics_for_trainer(eval_pred):
     all_predictions = predictions.flatten()
     all_labels = labels.flatten()
 
-    return compute_switch_metrics(all_predictions, all_labels)
+    # Remove padding
+    mask = all_labels != -100
+    all_predictions = all_predictions[mask]
+    all_labels = all_labels[mask]
+
+    # Basic accuracy
+    accuracy = (all_predictions == all_labels).mean()
+
+    # Proximity-aware switch metrics with TYPE matching
+    switch_metrics = evaluate_switch_detection_with_proximity(
+        all_labels, all_predictions, tolerance=tolerance
+    )
+
+    return {
+        'accuracy': float(accuracy),
+        'switch_precision': float(switch_metrics['precision']),
+        'switch_recall': float(switch_metrics['recall']),
+        'switch_f1': float(switch_metrics['f1']),
+        'true_switches': switch_metrics['true_switches'],
+        'pred_switches': switch_metrics['pred_switches'],
+        'exact_matches': switch_metrics['exact_matches'],
+        'proximity_matches': switch_metrics['proximity_matches'],
+        # Per-type metrics
+        'to_auto_precision': float(switch_metrics['to_auto_precision']),
+        'to_auto_recall': float(switch_metrics['to_auto_recall']),
+        'to_allo_precision': float(switch_metrics['to_allo_precision']),
+        'to_allo_recall': float(switch_metrics['to_allo_recall']),
+        'true_to_auto': switch_metrics['true_to_auto'],
+        'true_to_allo': switch_metrics['true_to_allo'],
+        'matched_to_auto': switch_metrics['matched_to_auto'],
+        'matched_to_allo': switch_metrics['matched_to_allo']
+    }
 
 
 # ============================================================================
-# PART 5: TRAINER
+# PART 5: CUSTOM TRAINER
 # ============================================================================
 
 class ProximityAwareTrainer4Class(Trainer):
-    """Custom trainer for 4-class system."""
+    """Custom trainer with proximity-aware loss"""
 
-    def __init__(self, switch_loss_weight=20.0, false_positive_penalty=5.0, *args, **kwargs):
+    def __init__(self, switch_loss_weight=20.0, proximity_tolerance=5,
+                 distance_decay=0.8, *args, **kwargs):
+        # Handle tokenizer/processing_class
         if 'tokenizer' in kwargs and 'processing_class' not in kwargs:
             kwargs['processing_class'] = kwargs.get('tokenizer')
 
         super().__init__(*args, **kwargs)
+
+        # Initialize custom loss
         self.proximity_loss = ProximityAwareLoss4Class(
             switch_loss_weight=switch_loss_weight,
-            false_positive_penalty=false_positive_penalty
+            proximity_tolerance=proximity_tolerance,
+            distance_decay=distance_decay
         )
+        self.proximity_tolerance = proximity_tolerance
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
@@ -544,9 +774,189 @@ class ProximityAwareTrainer4Class(Trainer):
         loss = self.proximity_loss(logits, labels)
         return (loss, outputs) if return_outputs else loss
 
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        # Override to use proximity-aware metrics
+        self.compute_metrics = lambda eval_pred: compute_metrics_for_trainer(
+            eval_pred, tolerance=self.proximity_tolerance
+        )
+        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+
 
 # ============================================================================
-# PART 6: MAIN TRAINING PIPELINE
+# PART 6: EVALUATION AND VISUALIZATION
+# ============================================================================
+
+def print_test_examples_proximity(model, tokenizer, test_csv='test_segments.csv',
+                                 num_examples=5, tolerance=5):
+    """
+    Print detailed test examples with proximity-aware evaluation
+    Shows TYPE-specific switch matching
+    """
+    print("\n" + "=" * 80)
+    print(f"PROXIMITY-AWARE SWITCH DETECTION ANALYSIS (tolerance={tolerance} tokens)")
+    print("Matching requires SAME switch type (auto→allo vs allo→auto)")
+    print("=" * 80)
+
+    test_df = pd.read_csv(test_csv)
+    device = next(model.parameters()).device
+    model.eval()
+
+    label_names = {
+        0: 'NonSwitch-Auto',
+        1: 'NonSwitch-Allo',
+        2: 'SWITCH→Auto',
+        3: 'SWITCH→Allo'
+    }
+
+    # Sample examples
+    sample_indices = np.random.choice(len(test_df), min(num_examples, len(test_df)), replace=False)
+
+    for i, idx in enumerate(sample_indices):
+        row = test_df.iloc[idx]
+        tokens = row['tokens'].split()
+        true_labels = list(map(int, row['labels'].split(',')))
+
+        print(f"\n--- Example {i+1} (from {row['source_file']}) ---")
+        print(f"Segment length: {row['num_tokens']} tokens")
+        print(f"Expected transitions: {row['num_transitions']}")
+
+        # Get predictions
+        tokenizer_output = tokenizer(
+            tokens,
+            is_split_into_words=True,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+
+        inputs = {k: v.to(device) for k, v in tokenizer_output.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            predictions = torch.argmax(outputs.logits, dim=2)
+            probs = torch.softmax(outputs.logits, dim=2)
+
+        # Align predictions
+        word_ids = tokenizer_output.word_ids()
+        aligned_predictions = []
+        aligned_probs = []
+        previous_word_idx = None
+
+        for j, word_idx in enumerate(word_ids):
+            if word_idx is not None and word_idx != previous_word_idx:
+                pred = predictions[0][j].item()
+                prob = probs[0][j].cpu().numpy()
+                aligned_predictions.append(pred)
+                aligned_probs.append(prob)
+            previous_word_idx = word_idx
+
+        # Trim to match
+        final_len = min(len(aligned_predictions), len(true_labels), len(tokens))
+        aligned_predictions = aligned_predictions[:final_len]
+        true_labels = true_labels[:final_len]
+        tokens = tokens[:final_len]
+
+        # Evaluate with proximity and type matching
+        switch_eval = evaluate_switch_detection_with_proximity(true_labels, aligned_predictions, tolerance)
+
+        # Show switch analysis BY TYPE
+        true_to_auto = [(j, 2) for j, l in enumerate(true_labels) if l == 2]
+        true_to_allo = [(j, 3) for j, l in enumerate(true_labels) if l == 3]
+        pred_to_auto = [(j, 2) for j, l in enumerate(aligned_predictions) if l == 2]
+        pred_to_allo = [(j, 3) for j, l in enumerate(aligned_predictions) if l == 3]
+
+        print(f"\nSwitch Detection Summary:")
+        print(f"  True SWITCH→Auto: {len(true_to_auto)} at positions {[pos for pos, _ in true_to_auto]}")
+        print(f"  True SWITCH→Allo: {len(true_to_allo)} at positions {[pos for pos, _ in true_to_allo]}")
+        print(f"  Pred SWITCH→Auto: {len(pred_to_auto)} at positions {[pos for pos, _ in pred_to_auto]}")
+        print(f"  Pred SWITCH→Allo: {len(pred_to_allo)} at positions {[pos for pos, _ in pred_to_allo]}")
+
+        print(f"\nMatching Results (TYPE must match):")
+        print(f"  Exact matches: {switch_eval['exact_matches']}")
+        print(f"  Proximity matches: {switch_eval['proximity_matches']} (within {tolerance} tokens)")
+        print(f"  SWITCH→Auto matched: {switch_eval['matched_to_auto']}/{switch_eval['true_to_auto']}")
+        print(f"  SWITCH→Allo matched: {switch_eval['matched_to_allo']}/{switch_eval['true_to_allo']}")
+
+        print(f"\nOverall Performance:")
+        print(f"  Switch Precision: {switch_eval['precision']:.3f}")
+        print(f"  Switch Recall: {switch_eval['recall']:.3f}")
+        print(f"  Switch F1: {switch_eval['f1']:.3f}")
+
+        # Detailed distance analysis
+        if pred_to_auto or pred_to_allo:
+            print(f"\nDistance Analysis (TYPE-SPECIFIC):")
+
+            # Analyze Switch→Auto predictions
+            for pred_pos, _ in pred_to_auto:
+                if true_to_auto:
+                    distances = [abs(pred_pos - true_pos) for true_pos, _ in true_to_auto]
+                    min_distance = min(distances)
+
+                    if min_distance == 0:
+                        status = "✓ EXACT MATCH (Switch→Auto)"
+                    elif min_distance <= tolerance:
+                        status = f"✓ PROXIMITY MATCH (±{min_distance}, Switch→Auto)"
+                    else:
+                        status = f"✗ TOO FAR (±{min_distance})"
+                else:
+                    status = "✗ FALSE: predicted Switch→Auto but no true Switch→Auto exists"
+
+                print(f"  Pred Switch→Auto at pos {pred_pos}: {status}")
+
+            # Analyze Switch→Allo predictions
+            for pred_pos, _ in pred_to_allo:
+                if true_to_allo:
+                    distances = [abs(pred_pos - true_pos) for true_pos, _ in true_to_allo]
+                    min_distance = min(distances)
+
+                    if min_distance == 0:
+                        status = "✓ EXACT MATCH (Switch→Allo)"
+                    elif min_distance <= tolerance:
+                        status = f"✓ PROXIMITY MATCH (±{min_distance}, Switch→Allo)"
+                    else:
+                        status = f"✗ TOO FAR (±{min_distance})"
+                else:
+                    status = "✗ FALSE: predicted Switch→Allo but no true Switch→Allo exists"
+
+                print(f"  Pred Switch→Allo at pos {pred_pos}: {status}")
+
+        # Show switch regions only
+        all_switch_positions = set([pos for pos, _ in true_to_auto + true_to_allo + pred_to_auto + pred_to_allo])
+
+        if all_switch_positions:
+            print(f"\nSwitch Region Details (showing ±3 context):")
+
+            for switch_pos in sorted(all_switch_positions):
+                start = max(0, switch_pos - 3)
+                end = min(len(tokens), switch_pos + 4)
+
+                print(f"\n  Around position {switch_pos}:")
+                for pos in range(start, end):
+                    if pos < len(tokens):
+                        token = tokens[pos]
+                        true_label = label_names[true_labels[pos]]
+                        pred_label = label_names[aligned_predictions[pos]]
+                        marker = "→" if pos == switch_pos else " "
+
+                        # Check if types match when both are switches
+                        if true_labels[pos] >= 2 and aligned_predictions[pos] >= 2:
+                            if true_labels[pos] == aligned_predictions[pos]:
+                                match = "✓ TYPE MATCH"
+                            else:
+                                match = "✗ WRONG TYPE"
+                        elif true_labels[pos] == aligned_predictions[pos]:
+                            match = "✓"
+                        else:
+                            match = "✗"
+
+                        print(f"    {marker} [{pos:3d}] {token:15s} | True: {true_label:15s} | Pred: {pred_label:15s} | {match}")
+
+    return sample_indices
+
+
+# ============================================================================
+# PART 7: MAIN TRAINING PIPELINE
 # ============================================================================
 
 def train_tibetan_code_switching():
@@ -555,10 +965,11 @@ def train_tibetan_code_switching():
     """
     print("=" * 60)
     print("TIBETAN CODE-SWITCHING DETECTION TRAINING")
+    print("With Proximity-Aware Loss (5-token tolerance)")
     print("=" * 60)
 
     # Step 1: Process all files
-    print("\nSTEP 1: Processing files with transitions...")
+    print("\nSTEP 1: Processing files...")
     data_dir = 'classify_allo_auto/data'
 
     if not os.path.exists(data_dir):
@@ -572,7 +983,7 @@ def train_tibetan_code_switching():
         return
 
     # Save processed data
-    df.to_csv('all_segments_with_transitions.csv', index=False)
+    df.to_csv('all_segments_300_400_tokens.csv', index=False)
 
     # Step 2: Create train/val/test split
     print("\nSTEP 2: Creating train/val/test split...")
@@ -581,7 +992,7 @@ def train_tibetan_code_switching():
     # Step 3: Initialize model
     print("\nSTEP 3: Initializing model...")
     model_name = 'OMRIDRORI/mbert-tibetan-continual-unicode-240k'
-    output_dir = './tibetan_code_switching_model'
+    output_dir = './tibetan_code_switching_proximity_model'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -610,7 +1021,7 @@ def train_tibetan_code_switching():
     data_collator = DataCollatorForTokenClassification(tokenizer)
 
     # Step 5: Training
-    print("\nSTEP 5: Starting training...")
+    print("\nSTEP 5: Starting training with proximity-aware loss...")
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -619,8 +1030,8 @@ def train_tibetan_code_switching():
         save_strategy="steps",
         save_steps=100,
         learning_rate=2e-5,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
+        per_device_train_batch_size=4,  # Reduced due to larger segments
+        per_device_eval_batch_size=4,
         num_train_epochs=15,
         weight_decay=0.01,
         logging_dir=f'{output_dir}/logs',
@@ -631,12 +1042,11 @@ def train_tibetan_code_switching():
         warmup_steps=100,
         save_total_limit=3,
         fp16=torch.cuda.is_available(),
-        report_to=[],  # Disable external reporting to avoid DVCLive issues
-        push_to_hub=True,  # Enable pushing to Hugging Face Hub
-        # hub_model_id="levshechter/tibetan-code-switching-detector",  # Change this to your HF username
-        # hub_strategy="end",  # Push only at the end of training
+        report_to=[],
+        gradient_accumulation_steps=2,  # Effective batch size of 8
     )
 
+    # Custom trainer with proximity-aware loss
     trainer = ProximityAwareTrainer4Class(
         model=model,
         args=training_args,
@@ -644,9 +1054,10 @@ def train_tibetan_code_switching():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         processing_class=tokenizer,
-        compute_metrics=compute_metrics_for_trainer,
+        compute_metrics=lambda eval_pred: compute_metrics_for_trainer(eval_pred, tolerance=5),
         switch_loss_weight=20.0,
-        false_positive_penalty=5.0
+        proximity_tolerance=5,
+        distance_decay=0.8
     )
 
     # Train the model
@@ -657,20 +1068,27 @@ def train_tibetan_code_switching():
     tokenizer.save_pretrained(f'{output_dir}/final_model')
 
     # Step 6: Evaluation
-    print("\nSTEP 6: Evaluating on test set...")
+    print("\nSTEP 6: Evaluating on test set with proximity tolerance...")
 
     test_results = trainer.evaluate(eval_dataset=test_dataset)
 
-    print(f"\n=== Final Test Results ===")
+    print(f"\n=== Final Test Results (5-token tolerance) ===")
     print(f"Accuracy: {test_results['eval_accuracy']:.3f}")
     print(f"Switch F1: {test_results['eval_switch_f1']:.3f}")
     print(f"Switch Precision: {test_results['eval_switch_precision']:.3f}")
     print(f"Switch Recall: {test_results['eval_switch_recall']:.3f}")
+    print(f"Exact Matches: {test_results.get('eval_exact_matches', 0)}")
+    print(f"Proximity Matches: {test_results.get('eval_proximity_matches', 0)}")
     print(f"True Switches: {test_results['eval_true_switches']}")
     print(f"Predicted Switches: {test_results['eval_pred_switches']}")
 
+    # Show some examples
+    print("\nShowing test examples...")
+    print_test_examples_proximity(model, tokenizer, 'test_segments.csv', num_examples=3, tolerance=5)
+
     print(f"\n=== Training Complete ===")
     print(f"Model saved to: {output_dir}/final_model")
+    print(f"Using 5-token proximity tolerance for switch detection")
 
     return trainer, model, tokenizer, test_results
 
