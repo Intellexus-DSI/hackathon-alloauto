@@ -23,6 +23,8 @@ def flatten_directory(source_dir: str, dest_dir: str):
 
     # Walk through the source directory, including all subdirectories
     for dirpath, _, filenames in os.walk(source_dir):
+        print (f"Current directory: {dirpath}")
+        print (f"Filenames: {filenames}")
         # Skip the root source directory itself to avoid moving files from there
         if dirpath == source_dir:
             continue
@@ -46,6 +48,7 @@ def flatten_directory(source_dir: str, dest_dir: str):
                 # Move the file from the source to the destination
                 shutil.move(source_file_path, dest_file_path)
                 print(f"Moved: '{source_file_path}' -> '{dest_file_path}'")
+                print("final counter:", counter)
             except Exception as e:
                 print(f"Error moving file '{source_file_path}': {e}")
 
