@@ -619,17 +619,14 @@ class CodeSwitchingInference4Class:
 if __name__ == "__main__":
     # Initialize inference with your trained model
     inferencer = CodeSwitchingInference4Class(
-        "levshechter/tibetan-CS-detector")
+        "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie")
 
     # Your tagged text
     # text = """<auto>thams cad la yang shes par bya'o de la ji ltar de chos thams cad kyi rang bzhin nam bdag nyid yin zhe na 'di nyid las gsungs pa
     # <allo>dngos po kun gyi rang bzhin mchog dngos po kun gyi rang bzhin 'dzin skye med chos te sna tshogs ston chos kun ngo bo nyid 'chang ba
     # <auto>zhes gsungs pa lta bu dang
     # <allo>rnam rig sna tshogs gzugs don can rnam shes sna tshogs rgyud dang ldan"""
-    text = """thams cad la yang shes par bya'o de la ji ltar de chos thams cad kyi rang bzhin nam bdag nyid yin zhe na 'di nyid las gsungs pa
-    dngos po kun gyi rang bzhin mchog dngos po kun gyi rang bzhin 'dzin skye med chos te sna tshogs ston chos kun ngo bo nyid 'chang ba
-    zhes gsungs pa lta bu dang
-    rnam rig sna tshogs gzugs don can rnam shes sna tshogs rgyud dang ldan"""
+    text = """nyid las skyes pa yang yin pa'i phyir te/ tshul bcu po 'di ni/ 'khor ba dang mya ngan las 'das pa'i chos thams cad la yang shes par bya'o// de la ji ltar/ de chos thams cad kyi rang bzhin nam bdag nyid yin zhe na/ 'di nyid las gsungs pa/ <allo>dngos po kun gyi rang bzhin mchog// dngos po kun gyi rang bzhin 'dzin// skye med chos te sna tshogs ston// chos kun ngo bo nyid 'chang ba//<auto>zhes gsungs pa lta bu dang /<allo>rnam rig sna tshogs gzugs don can// rnam shes sna tshogs rgyud dang ldan// zhes gsungs pa dang / <allo>sdug bsngal gsum gyi sdug bsngal zhi////<auto> zhes pa dang / <allo>rnam pa bcu po don bcu'i don// <auto> zhes pa dang // <allo>don 'grub bsam pa grub pa ste// kun tu rtog pa thams cad spangs// <auto>shes bya ba la sos pa lta bu'i skabs su bshad pa/ dngos po thams cad kyi rang bzhin dang / dngos po med pa'i chos kyi rang bzhin dang / chos thams cad kyi ngo bo nyid """
 
     print("=" * 80)
     print("TESTING WITH ALL FEATURES ENABLED")
