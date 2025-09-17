@@ -25,15 +25,7 @@ def clean_line(line: str) -> str:
     return line
 
 
-def analyze_file(
-    filepath: str,
-    window_size: int = 4,
-    min_section_length: int = 4,
-    min_probability: float = 0.7,
-    min_gap: int = 0,
-) -> List[Dict]:
-    """Analyze a single file for verse sections."""
-
+def analyze_file(filepath):
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -41,24 +33,53 @@ def analyze_file(
         print(f"Error reading {filepath}: {e}")
         return []
 
-    # Clean and filter lines
-    cleaned_lines = []
-    for line in lines:
+    segment_sections = []
+    buffer_lines = []   # collect consecutive short lines
+    buffer_start = None # track first line number
+
+    for i, line in enumerate(lines):
         line = clean_line(line)
-        if line:
-            cleaned_lines.append(line)
+        if not line:
+            continue
 
-    if len(cleaned_lines) < min_section_length:
-        return []
+        # add current line to buffer
+        buffer_lines.append(line)
+        if buffer_start is None:
+            buffer_start = i
 
-    return lines
+        # calculate total words across buffer
+        total_words = sum(len(l.split()) for l in buffer_lines)
+
+        if total_words >= 15:
+            # save the buffered lines as a segment
+            segment_sections.append(
+                {
+                    "text": os.path.basename(filepath),
+                    "line_numbers": [buffer_start, i],
+                    "lines": buffer_lines,  # store as list
+                }
+            )
+            buffer_lines = []
+            buffer_start = None
+
+    # if something is left in buffer and never reached threshold
+    if buffer_lines:
+        segment_sections.append(
+            {
+                "text": os.path.basename(filepath),
+                "final_line_number": buffer_start + len(buffer_lines) - 1,
+                "lines": buffer_lines[:],
+            }
+        )
+
+    return segment_sections
+
+
 
 
 def main():
     """Main function to process all files in the corpus directory."""
 
-    # corpus_dir = "/home/mike/data/zozerta/derge_tshad_split_corpus/train"
-    # output_dir = "/home/mike/data/zozerta/verse_prose/scrolling_window"
     corpus_dir = "/home/guyb/hackathon-alloauto/bjornpixel/Sungbum_flat_shortened_test"
     output_dir = "/home/guyb/hackathon-alloauto/bjornpixel/per_line_output"
 
@@ -73,7 +94,6 @@ def main():
 
     # Process all .txt files in the directory
     for filename in sorted(os.listdir(corpus_dir)):
-        if filename.endswith(".txt"):
             print(filename)
             filepath = os.path.join(corpus_dir, filename)
             print(f"Processing {filename}...")
@@ -81,7 +101,11 @@ def main():
             file_segments = analyze_file(filepath)
 
             # Save individual file results
-            output_filename = filename.replace(".txt", "_verse_analysis.json")
+            if filename.endswith(".txt"):
+                output_filename = filename.replace(".txt", "_verse_analysis.json")
+            elif filename.endswith(".TXT"):
+                output_filename = filename.replace(".TXT", "_verse_analysis.json")
+
             output_filepath = os.path.join(output_dir, output_filename)
 
             with open(output_filepath, "w", encoding="utf-8") as f:
