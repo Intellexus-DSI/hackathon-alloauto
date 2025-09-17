@@ -1208,7 +1208,7 @@ def train_tibetan_code_switching():
 
     # Step 3: Initialize model with better configuration
     print("\nSTEP 3: Initializing model...")
-    model_name = 'OMRIDRORI/mbert-tibetan-continual-unicode-240k'
+    model_name = 'OMRIDRORI/mbert-tibetan-continual-wylie-final'
     output_dir = './tibetan_code_switching_constrained_model'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1282,7 +1282,7 @@ def train_tibetan_code_switching():
         learning_rate=1e-5,
         per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
-        num_train_epochs=25,  # More epochs to learn both switch types
+        num_train_epochs=35,  # More epochs to learn both switch types
         weight_decay=0.1,
         logging_dir=f'{output_dir}/logs',
         logging_steps=20,
@@ -1296,6 +1296,8 @@ def train_tibetan_code_switching():
         gradient_accumulation_steps=4,
         label_smoothing_factor=0.05,  # Reduced smoothing
         gradient_checkpointing=True,
+        push_to_hub=True,  # Enable pushing to HF
+        hub_model_id="levshechter/tibetan-CS-detector",  # Your HF repo
     )
 
     # Custom trainer with logical constraints
@@ -1311,7 +1313,8 @@ def train_tibetan_code_switching():
         proximity_tolerance=5,
         distance_decay=0.7,
         false_positive_penalty=10.0,
-        invalid_transition_penalty=100.0  # Very high penalty for invalid transitions
+        invalid_transition_penalty=100.0  # Very high penalty for invalid transitions,
+
     )
 
     # Add early stopping callback
