@@ -1,0 +1,1963 @@
+"""
+Unified evaluation script with sklearn's fbeta_score and full test set comparison
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+import re
+import onnxruntime as ort
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from sklearn.metrics import fbeta_score, precision_score, recall_score, f1_score
+
+
+def process_binary_model_sentence_level(tokens, tokenizer, session):
+    """
+    Process tokens through binary model which works at sentence level
+    The model classifies chunks/sentences, not individual tokens
+    """
+    # Reconstruct text from tokens
+    text = " ".join(tokens)
+
+    # Split into chunks/sentences (following the JS implementation)
+    # The JS splits by / or //
+    chunks = re.split(r'\s*/+\s*', text)
+    chunks = [c.strip() for c in chunks if c.strip()]
+
+    if not chunks:
+        # If no chunks, treat entire text as one chunk
+        chunks = [text]
+
+    # Classify each chunk
+    chunk_predictions = []
+
+    for chunk in chunks:
+        if not chunk:
+            continue
+
+        # Tokenize the chunk
+        inputs = tokenizer(
+            chunk,
+            return_tensors="np",
+            padding=False,
+            truncation=True,
+            max_length=512
+        )
+
+        # Get ONNX inputs
+        onnx_inputs = {inp.name for inp in session.get_inputs()}
+        filtered_inputs = {}
+        for key, value in inputs.items():
+            if key in onnx_inputs:
+                filtered_inputs[key] = value
+
+        # Run inference
+        outputs = session.run(None, filtered_inputs)
+        logits = outputs[0]
+
+        # Apply softmax to get probabilities
+        if len(logits.shape) == 2:
+            logits = logits[0]  # Remove batch dimension if present
+
+        # Softmax
+        exp_logits = np.exp(logits - np.max(logits))
+        probs = exp_logits / np.sum(exp_logits)
+
+        # Class 0 is allo, class 1 is auto (based on the JS code)
+        predicted_class = np.argmax(probs)
+        chunk_predictions.append(predicted_class)
+
+    # Now map chunk-level predictions back to token level
+    token_labels = []
+    token_idx = 0
+
+    for chunk_idx, chunk in enumerate(chunks):
+        chunk_tokens = chunk.split()
+        chunk_class = chunk_predictions[chunk_idx] if chunk_idx < len(chunk_predictions) else 0
+
+        # Determine if this is a switch
+        is_switch = False
+        if chunk_idx > 0 and chunk_idx < len(chunk_predictions):
+            prev_class = chunk_predictions[chunk_idx - 1]
+            curr_class = chunk_predictions[chunk_idx]
+            if prev_class != curr_class:
+                is_switch = True
+
+        # Assign labels to tokens in this chunk
+        for i, token in enumerate(chunk_tokens):
+            if token_idx < len(tokens):
+                if i == 0 and is_switch:
+                    # First token of a chunk that switches
+                    if chunk_class == 0:  # Switching to allo
+                        label = 3  # Switch to Allo
+                    else:  # Switching to auto
+                        label = 2  # Switch to Auto
+                else:
+                    # Continuation in current mode
+                    if chunk_class == 0:  # Allo
+                        label = 1  # Non-switch Allo
+                    else:  # Auto
+                        label = 0  # Non-switch Auto
+
+                token_labels.append(label)
+                token_idx += 1
+
+    # Handle any remaining tokens (shouldn't happen but just in case)
+    while len(token_labels) < len(tokens):
+        token_labels.append(0)  # Default to Auto
+
+    return token_labels[:len(tokens)]
+
+
+def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance=5):
+    """
+    Evaluate with proximity tolerance - ALL metrics use 5-token tolerance for matching
+    """
+    true_labels = np.array(true_labels)
+    pred_labels = np.array(pred_labels)
+
+    # Find switch positions BY TYPE
+    true_switches_to_auto = np.where(true_labels == 2)[0]
+    true_switches_to_allo = np.where(true_labels == 3)[0]
+    pred_switches_to_auto = np.where(pred_labels == 2)[0]
+    pred_switches_to_allo = np.where(pred_labels == 3)[0]
+
+    # Track matches separately by type (WITH TOLERANCE)
+    matched_true_to_auto = set()
+    matched_pred_to_auto = set()
+    matched_true_to_allo = set()
+    matched_pred_to_allo = set()
+
+    exact_matches = 0
+    proximity_matches = 0
+
+    # [Keep all the matching logic as before - Match with tolerance]
+    for pred_pos in pred_switches_to_auto:
+        if len(true_switches_to_auto) > 0:
+            distances = np.abs(true_switches_to_auto - pred_pos)
+            min_distance = np.min(distances)
+            closest_true_idx = np.argmin(distances)
+            closest_true_pos = true_switches_to_auto[closest_true_idx]
+
+            if closest_true_pos not in matched_true_to_auto and min_distance <= tolerance:
+                if min_distance == 0:
+                    exact_matches += 1
+                else:
+                    proximity_matches += 1
+                matched_true_to_auto.add(closest_true_pos)
+                matched_pred_to_auto.add(pred_pos)
+
+    for pred_pos in pred_switches_to_allo:
+        if len(true_switches_to_allo) > 0:
+            distances = np.abs(true_switches_to_allo - pred_pos)
+            min_distance = np.min(distances)
+            closest_true_idx = np.argmin(distances)
+            closest_true_pos = true_switches_to_allo[closest_true_idx]
+
+            if closest_true_pos not in matched_true_to_allo and min_distance <= tolerance:
+                if min_distance == 0:
+                    exact_matches += 1
+                else:
+                    proximity_matches += 1
+                matched_true_to_allo.add(closest_true_pos)
+                matched_pred_to_allo.add(pred_pos)
+
+    # Total counts
+    total_true_switches = len(true_switches_to_auto) + len(true_switches_to_allo)
+    total_pred_switches = len(pred_switches_to_auto) + len(pred_switches_to_allo)
+    total_matches = exact_matches + proximity_matches
+
+    # Overall metrics WITH TOLERANCE
+    proximity_precision = total_matches / total_pred_switches if total_pred_switches > 0 else 0
+    proximity_recall = total_matches / total_true_switches if total_true_switches > 0 else 0
+    proximity_f1 = 2 * proximity_precision * proximity_recall / (proximity_precision + proximity_recall) if (
+                                                                                                                        proximity_precision + proximity_recall) > 0 else 0
+
+    beta = 2
+    proximity_fbeta2 = ((1 + beta ** 2) * proximity_precision * proximity_recall /
+                        (beta ** 2 * proximity_precision + proximity_recall)) if (
+                                                                                             proximity_precision + proximity_recall) > 0 else 0
+
+    # Per-type metrics WITH TOLERANCE
+    to_auto_prox_precision = len(matched_pred_to_auto) / len(pred_switches_to_auto) if len(
+        pred_switches_to_auto) > 0 else 0
+    to_auto_prox_recall = len(matched_true_to_auto) / len(true_switches_to_auto) if len(
+        true_switches_to_auto) > 0 else 0
+    to_auto_prox_f1 = 2 * to_auto_prox_precision * to_auto_prox_recall / (
+                to_auto_prox_precision + to_auto_prox_recall) if (
+                                                                             to_auto_prox_precision + to_auto_prox_recall) > 0 else 0
+    to_auto_prox_fbeta2 = ((1 + beta ** 2) * to_auto_prox_precision * to_auto_prox_recall /
+                           (beta ** 2 * to_auto_prox_precision + to_auto_prox_recall)) if (
+                                                                                                      to_auto_prox_precision + to_auto_prox_recall) > 0 else 0
+
+    to_allo_prox_precision = len(matched_pred_to_allo) / len(pred_switches_to_allo) if len(
+        pred_switches_to_allo) > 0 else 0
+    to_allo_prox_recall = len(matched_true_to_allo) / len(true_switches_to_allo) if len(
+        true_switches_to_allo) > 0 else 0
+    to_allo_prox_f1 = 2 * to_allo_prox_precision * to_allo_prox_recall / (
+                to_allo_prox_precision + to_allo_prox_recall) if (
+                                                                             to_allo_prox_precision + to_allo_prox_recall) > 0 else 0
+    to_allo_prox_fbeta2 = ((1 + beta ** 2) * to_allo_prox_precision * to_allo_prox_recall /
+                           (beta ** 2 * to_allo_prox_precision + to_allo_prox_recall)) if (
+                                                                                                      to_allo_prox_precision + to_allo_prox_recall) > 0 else 0
+
+    # Calculate MACRO averages
+    macro_proximity_precision = (to_auto_prox_precision + to_allo_prox_precision) / 2
+    macro_proximity_recall = (to_auto_prox_recall + to_allo_prox_recall) / 2
+    macro_proximity_f1 = (to_auto_prox_f1 + to_allo_prox_f1) / 2
+    macro_proximity_fbeta2 = (to_auto_prox_fbeta2 + to_allo_prox_fbeta2) / 2
+
+    # Exact metrics (NO tolerance) - for backward compatibility
+    true_binary = (true_labels >= 2).astype(int)
+    pred_binary = (pred_labels >= 2).astype(int)
+
+    exact_precision = precision_score(true_binary, pred_binary, zero_division=0)
+    exact_recall = recall_score(true_binary, pred_binary, zero_division=0)
+    exact_f1 = f1_score(true_binary, pred_binary, zero_division=0)
+    exact_fbeta2 = fbeta_score(true_binary, pred_binary, beta=2, zero_division=0)
+
+    # Calculate exact macro metrics (if needed for backward compatibility)
+    switch_labels = [2, 3]
+    try:
+        exact_macro_f1 = f1_score(true_labels, pred_labels, labels=switch_labels, average='macro', zero_division=0)
+        exact_macro_fbeta2 = fbeta_score(true_labels, pred_labels, labels=switch_labels, average='macro', beta=2,
+                                         zero_division=0)
+    except:
+        exact_macro_f1 = 0
+        exact_macro_fbeta2 = 0
+
+    return {
+        # Overall proximity metrics (WITH TOLERANCE)
+        'proximity_precision': proximity_precision,
+        'proximity_recall': proximity_recall,
+        'proximity_f1': proximity_f1,
+        'proximity_fbeta2': proximity_fbeta2,
+        'proximity_macro_fbeta2': macro_proximity_fbeta2,
+
+        # Per-class metrics WITH TOLERANCE
+        'to_auto_proximity_precision': to_auto_prox_precision,
+        'to_auto_proximity_recall': to_auto_prox_recall,
+        'to_auto_proximity_f1': to_auto_prox_f1,
+        'to_auto_proximity_fbeta2': to_auto_prox_fbeta2,
+
+        'to_allo_proximity_precision': to_allo_prox_precision,
+        'to_allo_proximity_recall': to_allo_prox_recall,
+        'to_allo_proximity_f1': to_allo_prox_f1,
+        'to_allo_proximity_fbeta2': to_allo_prox_fbeta2,
+
+        # ADD THESE ALIASES FOR BACKWARD COMPATIBILITY
+        'to_auto_fbeta2': to_auto_prox_fbeta2,
+        'to_allo_fbeta2': to_allo_prox_fbeta2,
+
+        # Macro metrics
+        'macro_precision': macro_proximity_precision,
+        'macro_recall': macro_proximity_recall,
+        'macro_f1': macro_proximity_f1,
+        'macro_fbeta2': macro_proximity_fbeta2,
+
+        # Exact metrics (NO tolerance)
+        'exact_precision': exact_precision,
+        'exact_recall': exact_recall,
+        'exact_f1': exact_f1,
+        'exact_fbeta2': exact_fbeta2,
+        'exact_macro_f1': exact_macro_f1,
+        'exact_macro_fbeta2': exact_macro_fbeta2,
+
+        # Counts
+        'exact_matches': exact_matches,
+        'proximity_matches': proximity_matches,
+        'total_matches': total_matches,
+        'true_switches': total_true_switches,
+        'pred_switches': total_pred_switches,
+        'true_to_auto': len(true_switches_to_auto),
+        'true_to_allo': len(true_switches_to_allo),
+        'pred_to_auto': len(pred_switches_to_auto),
+        'pred_to_allo': len(pred_switches_to_allo),
+        'matched_to_auto': len(matched_true_to_auto),
+        'matched_to_allo': len(matched_true_to_allo),
+    }
+def evaluate_switch_detection_with_proximity_v1(true_labels, pred_labels, tolerance=5):
+    """
+    Evaluate with proximity tolerance and F-beta scores for both exact and proximity-based metrics
+    """
+    true_labels = np.array(true_labels)
+    pred_labels = np.array(pred_labels)
+
+    # Find switch positions BY TYPE
+    true_switches_to_auto = np.where(true_labels == 2)[0]
+    true_switches_to_allo = np.where(true_labels == 3)[0]
+    pred_switches_to_auto = np.where(pred_labels == 2)[0]
+    pred_switches_to_allo = np.where(pred_labels == 3)[0]
+
+    # Track matches separately by type
+    matched_true_to_auto = set()
+    matched_pred_to_auto = set()
+    matched_true_to_allo = set()
+    matched_pred_to_allo = set()
+
+    exact_matches = 0
+    proximity_matches = 0
+
+    # Match "Switch to Auto" predictions
+    for pred_pos in pred_switches_to_auto:
+        if len(true_switches_to_auto) > 0:
+            distances = np.abs(true_switches_to_auto - pred_pos)
+            min_distance = np.min(distances)
+            closest_true_idx = np.argmin(distances)
+            closest_true_pos = true_switches_to_auto[closest_true_idx]
+
+            if closest_true_pos not in matched_true_to_auto:
+                if min_distance == 0:
+                    exact_matches += 1
+                    matched_true_to_auto.add(closest_true_pos)
+                    matched_pred_to_auto.add(pred_pos)
+                elif min_distance <= tolerance:
+                    proximity_matches += 1
+                    matched_true_to_auto.add(closest_true_pos)
+                    matched_pred_to_auto.add(pred_pos)
+
+    # Match "Switch to Allo" predictions
+    for pred_pos in pred_switches_to_allo:
+        if len(true_switches_to_allo) > 0:
+            distances = np.abs(true_switches_to_allo - pred_pos)
+            min_distance = np.min(distances)
+            closest_true_idx = np.argmin(distances)
+            closest_true_pos = true_switches_to_allo[closest_true_idx]
+
+            if closest_true_pos not in matched_true_to_allo:
+                if min_distance == 0:
+                    exact_matches += 1
+                    matched_true_to_allo.add(closest_true_pos)
+                    matched_pred_to_allo.add(pred_pos)
+                elif min_distance <= tolerance:
+                    proximity_matches += 1
+                    matched_true_to_allo.add(closest_true_pos)
+                    matched_pred_to_allo.add(pred_pos)
+
+    # Calculate all metrics
+    total_true_switches = len(true_switches_to_auto) + len(true_switches_to_allo)
+    total_pred_switches = len(pred_switches_to_auto) + len(pred_switches_to_allo)
+    total_matches = exact_matches + proximity_matches
+
+    # Overall proximity-based metrics
+    proximity_precision = total_matches / total_pred_switches if total_pred_switches > 0 else 0
+    proximity_recall = total_matches / total_true_switches if total_true_switches > 0 else 0
+    proximity_f1 = 2 * proximity_precision * proximity_recall / (proximity_precision + proximity_recall) if (
+                                                                                                                        proximity_precision + proximity_recall) > 0 else 0
+
+    beta = 2
+    proximity_fbeta2 = ((1 + beta ** 2) * proximity_precision * proximity_recall /
+                        (beta ** 2 * proximity_precision + proximity_recall)) if (
+                                                                                             proximity_precision + proximity_recall) > 0 else 0
+
+    # Per-type proximity metrics - THESE ARE THE MISSING ONES
+    to_auto_prox_precision = len(matched_pred_to_auto) / len(pred_switches_to_auto) if len(
+        pred_switches_to_auto) > 0 else 0
+    to_auto_prox_recall = len(matched_true_to_auto) / len(true_switches_to_auto) if len(
+        true_switches_to_auto) > 0 else 0
+    to_auto_prox_f1 = 2 * to_auto_prox_precision * to_auto_prox_recall / (
+                to_auto_prox_precision + to_auto_prox_recall) if (
+                                                                             to_auto_prox_precision + to_auto_prox_recall) > 0 else 0
+    to_auto_prox_fbeta2 = ((1 + beta ** 2) * to_auto_prox_precision * to_auto_prox_recall /
+                           (beta ** 2 * to_auto_prox_precision + to_auto_prox_recall)) if (
+                                                                                                      to_auto_prox_precision + to_auto_prox_recall) > 0 else 0
+
+    to_allo_prox_precision = len(matched_pred_to_allo) / len(pred_switches_to_allo) if len(
+        pred_switches_to_allo) > 0 else 0
+    to_allo_prox_recall = len(matched_true_to_allo) / len(true_switches_to_allo) if len(
+        true_switches_to_allo) > 0 else 0
+    to_allo_prox_f1 = 2 * to_allo_prox_precision * to_allo_prox_recall / (
+                to_allo_prox_precision + to_allo_prox_recall) if (
+                                                                             to_allo_prox_precision + to_allo_prox_recall) > 0 else 0
+    to_allo_prox_fbeta2 = ((1 + beta ** 2) * to_allo_prox_precision * to_allo_prox_recall /
+                           (beta ** 2 * to_allo_prox_precision + to_allo_prox_recall)) if (
+                                                                                                      to_allo_prox_precision + to_allo_prox_recall) > 0 else 0
+
+    macro_proximity_fbeta2 = (to_auto_prox_fbeta2 + to_allo_prox_fbeta2) / 2
+
+    # Return with ALL the metrics properly named
+    return {
+        # Overall proximity metrics
+        'proximity_precision': proximity_precision,
+        'proximity_recall': proximity_recall,
+        'proximity_f1': proximity_f1,
+        'proximity_fbeta2': proximity_fbeta2,
+        'proximity_macro_fbeta2': macro_proximity_fbeta2,
+
+        # Per-class metrics with proximity (THESE WERE MISSING!)
+        'to_auto_proximity_precision': to_auto_prox_precision,
+        'to_auto_proximity_recall': to_auto_prox_recall,
+        'to_auto_proximity_f1': to_auto_prox_f1,
+        'to_auto_proximity_fbeta2': to_auto_prox_fbeta2,
+
+        'to_allo_proximity_precision': to_allo_prox_precision,
+        'to_allo_proximity_recall': to_allo_prox_recall,
+        'to_allo_proximity_f1': to_allo_prox_f1,
+        'to_allo_proximity_fbeta2': to_allo_prox_fbeta2,
+
+        # Counts
+        'exact_matches': exact_matches,
+        'proximity_matches': proximity_matches,
+        'total_matches': total_matches,
+        'true_switches': total_true_switches,
+        'pred_switches': total_pred_switches,
+        'true_to_auto': len(true_switches_to_auto),
+        'true_to_allo': len(true_switches_to_allo),
+        'pred_to_auto': len(pred_switches_to_auto),
+        'pred_to_allo': len(pred_switches_to_allo),
+        'matched_to_auto': len(matched_true_to_auto),
+        'matched_to_allo': len(matched_true_to_allo),
+    }
+def evaluate_switch_detection_with_proximity_old(true_labels, pred_labels, tolerance=5):
+    """
+    Evaluate with proximity tolerance and F-beta scores for both exact and proximity-based metrics
+    """
+    true_labels = np.array(true_labels)
+    pred_labels = np.array(pred_labels)
+
+    # Find switch positions BY TYPE
+    true_switches_to_auto = np.where(true_labels == 2)[0]
+    true_switches_to_allo = np.where(true_labels == 3)[0]
+    pred_switches_to_auto = np.where(pred_labels == 2)[0]
+    pred_switches_to_allo = np.where(pred_labels == 3)[0]
+
+    # Track matches separately by type
+    matched_true_to_auto = set()
+    matched_pred_to_auto = set()
+    matched_true_to_allo = set()
+    matched_pred_to_allo = set()
+
+    exact_matches = 0
+    proximity_matches = 0
+
+    # Match "Switch to Auto" predictions
+    for pred_pos in pred_switches_to_auto:
+        if len(true_switches_to_auto) > 0:
+            distances = np.abs(true_switches_to_auto - pred_pos)
+            min_distance = np.min(distances)
+            closest_true_idx = np.argmin(distances)
+            closest_true_pos = true_switches_to_auto[closest_true_idx]
+
+            if closest_true_pos not in matched_true_to_auto:
+                if min_distance == 0:
+                    exact_matches += 1
+                    matched_true_to_auto.add(closest_true_pos)
+                    matched_pred_to_auto.add(pred_pos)
+                elif min_distance <= tolerance:
+                    proximity_matches += 1
+                    matched_true_to_auto.add(closest_true_pos)
+                    matched_pred_to_auto.add(pred_pos)
+
+    # Match "Switch to Allo" predictions
+    for pred_pos in pred_switches_to_allo:
+        if len(true_switches_to_allo) > 0:
+            distances = np.abs(true_switches_to_allo - pred_pos)
+            min_distance = np.min(distances)
+            closest_true_idx = np.argmin(distances)
+            closest_true_pos = true_switches_to_allo[closest_true_idx]
+
+            if closest_true_pos not in matched_true_to_allo:
+                if min_distance == 0:
+                    exact_matches += 1
+                    matched_true_to_allo.add(closest_true_pos)
+                    matched_pred_to_allo.add(pred_pos)
+                elif min_distance <= tolerance:
+                    proximity_matches += 1
+                    matched_true_to_allo.add(closest_true_pos)
+                    matched_pred_to_allo.add(pred_pos)
+
+    # Total counts
+    total_true_switches = len(true_switches_to_auto) + len(true_switches_to_allo)
+    total_pred_switches = len(pred_switches_to_auto) + len(pred_switches_to_allo)
+    total_matches = exact_matches + proximity_matches
+
+    # Proximity-based metrics
+    proximity_precision = total_matches / total_pred_switches if total_pred_switches > 0 else 0
+    proximity_recall = total_matches / total_true_switches if total_true_switches > 0 else 0
+    proximity_f1 = 2 * proximity_precision * proximity_recall / (proximity_precision + proximity_recall) if (
+                                                                                                                        proximity_precision + proximity_recall) > 0 else 0
+
+    beta = 2
+    proximity_fbeta2 = ((1 + beta ** 2) * proximity_precision * proximity_recall /
+                        (beta ** 2 * proximity_precision + proximity_recall)) if (
+                                                                                             proximity_precision + proximity_recall) > 0 else 0
+
+    # Per-type proximity metrics
+    to_auto_prox_precision = len(matched_pred_to_auto) / len(pred_switches_to_auto) if len(
+        pred_switches_to_auto) > 0 else 0
+    to_auto_prox_recall = len(matched_true_to_auto) / len(true_switches_to_auto) if len(
+        true_switches_to_auto) > 0 else 0
+    to_auto_prox_f1 = 2 * to_auto_prox_precision * to_auto_prox_recall / (
+                to_auto_prox_precision + to_auto_prox_recall) if (
+                                                                             to_auto_prox_precision + to_auto_prox_recall) > 0 else 0
+    to_auto_prox_fbeta2 = ((1 + beta ** 2) * to_auto_prox_precision * to_auto_prox_recall /
+                           (beta ** 2 * to_auto_prox_precision + to_auto_prox_recall)) if (
+                                                                                                      to_auto_prox_precision + to_auto_prox_recall) > 0 else 0
+
+    to_allo_prox_precision = len(matched_pred_to_allo) / len(pred_switches_to_allo) if len(
+        pred_switches_to_allo) > 0 else 0
+    to_allo_prox_recall = len(matched_true_to_allo) / len(true_switches_to_allo) if len(
+        true_switches_to_allo) > 0 else 0
+    to_allo_prox_f1 = 2 * to_allo_prox_precision * to_allo_prox_recall / (
+                to_allo_prox_precision + to_allo_prox_recall) if (
+                                                                             to_allo_prox_precision + to_allo_prox_recall) > 0 else 0
+    to_allo_prox_fbeta2 = ((1 + beta ** 2) * to_allo_prox_precision * to_allo_prox_recall /
+                           (beta ** 2 * to_allo_prox_precision + to_allo_prox_recall)) if (
+                                                                                                      to_allo_prox_precision + to_allo_prox_recall) > 0 else 0
+
+    macro_proximity_fbeta2 = (to_auto_prox_fbeta2 + to_allo_prox_fbeta2) / 2
+
+    # Exact metrics using sklearn
+    true_binary = (true_labels >= 2).astype(int)
+    pred_binary = (pred_labels >= 2).astype(int)
+
+    sklearn_precision = precision_score(true_binary, pred_binary, zero_division=0)
+    sklearn_recall = recall_score(true_binary, pred_binary, zero_division=0)
+    sklearn_f1 = f1_score(true_binary, pred_binary, zero_division=0)
+    sklearn_fbeta2 = fbeta_score(true_binary, pred_binary, beta=2, zero_division=0)
+
+    # Macro metrics
+    switch_labels = [2, 3]
+    try:
+        macro_precision = precision_score(true_labels, pred_labels, labels=switch_labels, average='macro',
+                                          zero_division=0)
+        macro_recall = recall_score(true_labels, pred_labels, labels=switch_labels, average='macro', zero_division=0)
+        macro_f1 = f1_score(true_labels, pred_labels, labels=switch_labels, average='macro', zero_division=0)
+        macro_fbeta2 = fbeta_score(true_labels, pred_labels, labels=switch_labels, average='macro', beta=2,
+                                   zero_division=0)
+    except:
+        macro_precision = macro_recall = macro_f1 = macro_fbeta2 = 0.0
+
+    return {
+        # Proximity-based metrics
+        'proximity_precision': proximity_precision,
+        'proximity_recall': proximity_recall,
+        'proximity_f1': proximity_f1,
+        'proximity_fbeta2': proximity_fbeta2,
+        'proximity_macro_fbeta2': macro_proximity_fbeta2,
+        'to_auto_proximity_fbeta2': to_auto_prox_fbeta2,
+        'to_allo_proximity_fbeta2': to_allo_prox_fbeta2,
+
+        # Add these for compatibility
+        'to_auto_fbeta2': to_auto_prox_fbeta2,  # For backward compatibility
+        'to_allo_fbeta2': to_allo_prox_fbeta2,  # For backward compatibility
+
+        # Exact metrics
+        'exact_precision': sklearn_precision,
+        'exact_recall': sklearn_recall,
+        'exact_f1': sklearn_f1,
+        'exact_fbeta2': sklearn_fbeta2,
+
+        # Macro metrics
+        'macro_precision': macro_precision,
+        'macro_recall': macro_recall,
+        'macro_f1': macro_f1,
+        'macro_fbeta2': macro_fbeta2,
+        'exact_macro_fbeta2': macro_fbeta2,
+
+        # Counts
+        'exact_matches': exact_matches,
+        'proximity_matches': proximity_matches,
+        'total_matches': total_matches,
+        'true_switches': total_true_switches,
+        'pred_switches': total_pred_switches,
+        'true_to_auto': len(true_switches_to_auto),
+        'true_to_allo': len(true_switches_to_allo),
+        'pred_to_auto': len(pred_switches_to_auto),
+        'pred_to_allo': len(pred_switches_to_allo),
+    }
+    ######
+
+def convert_binary_to_4class(binary_preds):
+    """Convert binary predictions to 4-class labels"""
+    labels_4class = []
+    prev_binary = None
+
+    for curr_binary in binary_preds:
+        if prev_binary is None:
+            labels_4class.append(0 if curr_binary == 0 else 1)
+        else:
+            if prev_binary == 0 and curr_binary == 1:
+                labels_4class.append(3)  # Switch to Allo
+            elif prev_binary == 1 and curr_binary == 0:
+                labels_4class.append(2)  # Switch to Auto
+            else:
+                labels_4class.append(0 if curr_binary == 0 else 1)
+        prev_binary = curr_binary
+
+    return labels_4class
+
+
+def process_binary_model(tokens, tokenizer, session):
+    """Process tokens through binary model and return 4-class predictions"""
+    inputs = tokenizer(
+        " ".join(tokens),
+        return_tensors="np",
+        padding=False,
+        truncation=True,
+        max_length=512
+    )
+
+    # Get the input names expected by the ONNX model
+    onnx_inputs = {inp.name for inp in session.get_inputs()}
+
+    # Filter inputs to only include what ONNX expects
+    filtered_inputs = {}
+    for key, value in inputs.items():
+        if key in onnx_inputs:
+            filtered_inputs[key] = value
+
+    # Run inference with filtered inputs
+    outputs = session.run(None, filtered_inputs)
+    predictions = outputs[0]
+
+    # Handle both single and batch predictions
+    if len(predictions.shape) == 3:  # Batch dimension exists
+        predicted_classes = np.argmax(predictions, axis=-1)[0]
+    elif len(predictions.shape) == 2:  # No batch dimension
+        predicted_classes = np.argmax(predictions, axis=-1)
+    else:
+        raise ValueError(f"Unexpected prediction shape: {predictions.shape}")
+
+    # Ensure predicted_classes is always an array
+    if predicted_classes.ndim == 0:  # It's a scalar
+        predicted_classes = np.array([predicted_classes])
+
+    word_ids = inputs.word_ids()
+    aligned_preds = []
+    previous_word_idx = None
+
+    for i, word_idx in enumerate(word_ids):
+        if word_idx is not None and word_idx != previous_word_idx:
+            if i < len(predicted_classes):
+                aligned_preds.append(predicted_classes[i])
+            else:
+                # If we run out of predictions, use the last one
+                aligned_preds.append(predicted_classes[-1] if len(predicted_classes) > 0 else 0)
+        previous_word_idx = word_idx
+
+    return convert_binary_to_4class(aligned_preds)
+def process_binary_model_old(tokens, tokenizer, session):
+    """Process tokens through binary model and return 4-class predictions"""
+    inputs = tokenizer(
+        " ".join(tokens),
+        return_tensors="np",
+        padding=False,
+        truncation=True,
+        max_length=512
+    )
+
+    outputs = session.run(None, dict(inputs))
+    predictions = outputs[0]
+    predicted_classes = np.argmax(predictions, axis=-1)[0]
+
+    word_ids = inputs.word_ids()
+    aligned_preds = []
+    previous_word_idx = None
+
+    for i, word_idx in enumerate(word_ids):
+        if word_idx is not None and word_idx != previous_word_idx:
+            aligned_preds.append(predicted_classes[i])
+        previous_word_idx = word_idx
+
+    return convert_binary_to_4class(aligned_preds)
+
+
+def process_finetuned_model(tokens, tokenizer, model, device):
+    """Process tokens through fine-tuned model"""
+    tokenizer_output = tokenizer(
+        tokens,
+        is_split_into_words=True,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512
+    )
+
+    inputs = {k: v.to(device) for k, v in tokenizer_output.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predictions = torch.argmax(outputs.logits, dim=2)
+
+    word_ids = tokenizer_output.word_ids()
+    aligned_preds = []
+    previous_word_idx = None
+
+    for j, word_idx in enumerate(word_ids):
+        if word_idx is not None and word_idx != previous_word_idx:
+            aligned_preds.append(predictions[0][j].item())
+        previous_word_idx = word_idx
+
+    return aligned_preds
+
+
+def unified_evaluation_old():
+    """Main evaluation function on complete test set"""
+
+    # Configuration
+    TEST_FILE = './test_segments.csv'
+    TOLERANCE = 5
+
+    print(f"Loading test data from: {TEST_FILE}")
+    test_df = pd.read_csv(TEST_FILE)
+    print(f"Test set size: {len(test_df)} segments")
+
+    # Calculate test set statistics
+    total_tokens = 0
+    total_switches = 0
+    for idx in range(len(test_df)):
+        labels = [int(l) for l in test_df.iloc[idx]['labels'].split(',')]
+        total_tokens += len(labels)
+        total_switches += sum(1 for l in labels if l in [2, 3])
+
+    print(f"Total tokens in test set: {total_tokens}")
+    print(f"Total switches in test set: {total_switches}")
+    print(f"Average switches per segment: {total_switches / len(test_df):.2f}\n")
+
+    # Load Binary Model
+    print("Loading Binary Model...")
+    binary_tokenizer = AutoTokenizer.from_pretrained('./alloauto/web/model')
+    binary_session = ort.InferenceSession('./alloauto/web/model/onnx/model.onnx')
+
+    # Load Fine-tuned Model
+    print("Loading Fine-tuned Model...")
+    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+    ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
+    ft_model.eval()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ft_model = ft_model.to(device)
+    print(f"Using device: {device}\n")
+
+    # Process all test segments
+    print("Processing all test segments...")
+    all_true_labels = []
+    binary_all_pred = []
+    finetuned_all_pred = []
+
+    for idx, row in test_df.iterrows():
+        if idx % 20 == 0:
+            print(f"  Processing segment {idx}/{len(test_df)}...")
+
+        tokens = row['tokens'].split()
+        true_labels = [int(l) for l in row['labels'].split(',')]
+
+        # Get predictions from both models
+        binary_pred = process_binary_model(tokens, binary_tokenizer, binary_session)
+        ft_pred = process_finetuned_model(tokens, ft_tokenizer, ft_model, device)
+
+        # Align all to same length
+        min_len = min(len(true_labels), len(binary_pred), len(ft_pred))
+
+        all_true_labels.extend(true_labels[:min_len])
+        binary_all_pred.extend(binary_pred[:min_len])
+        finetuned_all_pred.extend(ft_pred[:min_len])
+
+    print(f"\nTotal tokens evaluated: {len(all_true_labels)}")
+    print(f"Ground truth switches: {sum(1 for l in all_true_labels if l in [2, 3])}")
+    print(f"Binary predicted switches: {sum(1 for l in binary_all_pred if l in [2, 3])}")
+    print(f"Fine-tuned predicted switches: {sum(1 for l in finetuned_all_pred if l in [2, 3])}")
+
+    # Calculate metrics for both models
+    print("\nCalculating metrics...")
+
+
+    ####
+    binary_metrics = evaluate_switch_detection_with_proximity(all_true_labels, binary_all_pred, TOLERANCE)
+    finetuned_metrics = evaluate_switch_detection_with_proximity(all_true_labels, finetuned_all_pred, TOLERANCE)
+
+    # Print comprehensive results
+    print(f"\n{'=' * 100}")
+    print("COMPREHENSIVE EVALUATION RESULTS")
+    print(f"{'=' * 100}")
+
+    print(f"\n{'─' * 100}")
+    print("PROXIMITY-BASED METRICS (5-token tolerance)")
+    print(f"{'─' * 100}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print("-" * 100)
+
+    proximity_metrics = [
+        ('Precision (w/ tolerance)', 'proximity_precision'),
+        ('Recall (w/ tolerance)', 'proximity_recall'),
+        ('F1 (w/ tolerance)', 'proximity_f1'),
+    ]
+
+    for display, key in proximity_metrics:
+        b_val = binary_metrics[key]
+        f_val = finetuned_metrics[key]
+        diff = f_val - b_val
+        print(f"{display:<30} {b_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+
+    print(f"\n{'─' * 100}")
+    print("EXACT METRICS (sklearn - no tolerance)")
+    print(f"{'─' * 100}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print("-" * 100)
+    exact_metrics = [
+        ('Precision (exact)', 'exact_precision'),  # Changed from 'sklearn_precision'
+        ('Recall (exact)', 'exact_recall'),  # Changed from 'sklearn_recall'
+        ('F1 (exact)', 'exact_f1'),  # Changed from 'sklearn_f1'
+        ('F-beta(2) (exact)', 'exact_fbeta2'),  # Changed from 'sklearn_fbeta2'
+    ]
+
+    # Also update the key_metrics list in the winner selection:
+    key_metrics = ['proximity_f1', 'exact_fbeta2', 'proximity_macro_fbeta2']  # Changed from 'sklearn_fbeta2'
+
+    for display, key in exact_metrics:
+        b_val = binary_metrics[key]
+        f_val = finetuned_metrics[key]
+        diff = f_val - b_val
+        print(f"{display:<30} {b_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+
+    print(f"\n{'─' * 100}")
+    print("MACRO METRICS (average of switch types)")
+    print(f"{'─' * 100}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print("-" * 100)
+
+    macro_metrics = [
+        ('Macro Precision', 'macro_precision'),
+        ('Macro Recall', 'macro_recall'),
+        ('Macro F1', 'macro_f1'),
+        ('Macro F-beta(2)', 'macro_fbeta2'),
+    ]
+
+    for display, key in macro_metrics:
+        b_val = binary_metrics[key]
+        f_val = finetuned_metrics[key]
+        diff = f_val - b_val
+        print(f"{display:<30} {b_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+
+    print(f"\n{'─' * 100}")
+    print("PER-TYPE F-BETA(2) SCORES")
+    print(f"{'─' * 100}")
+    print(f"{'Switch Type':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print("-" * 100)
+
+    print(f"{'Switch→Auto F-beta(2)':<30} {binary_metrics['to_auto_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_auto_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_auto_fbeta2'] - binary_metrics['to_auto_fbeta2']:+20.3f}")
+    print(f"{'Switch→Allo F-beta(2)':<30} {binary_metrics['to_allo_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_allo_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_allo_fbeta2'] - binary_metrics['to_allo_fbeta2']:+20.3f}")
+
+    print(f"\n{'─' * 100}")
+    print("COUNT STATISTICS")
+    print(f"{'─' * 100}")
+    print(f"{'Statistic':<30} {'Binary Model':<20} {'Fine-tuned Model':<20}")
+    print("-" * 100)
+
+    count_stats = [
+        ('True Switches', 'true_switches'),
+        ('Predicted Switches', 'pred_switches'),
+        ('Exact Matches', 'exact_matches'),
+        ('Proximity Matches', 'proximity_matches'),
+        ('True Switch→Auto', 'true_to_auto'),
+        ('True Switch→Allo', 'true_to_allo'),
+        ('Pred Switch→Auto', 'pred_to_auto'),
+        ('Pred Switch→Allo', 'pred_to_allo'),
+    ]
+
+    for display, key in count_stats:
+        b_val = binary_metrics[key]
+        f_val = finetuned_metrics[key]
+        print(f"{display:<30} {b_val:<20} {f_val:<20}")
+
+    # Summary winner
+    print(f"\n{'=' * 100}")
+    print("SUMMARY")
+    print(f"{'=' * 100}")
+
+    winner_count = {'binary': 0, 'finetuned': 0}
+
+    # key_metrics = ['proximity_f1', 'sklearn_fbeta2', 'macro_fbeta2']
+    key_metrics = ['proximity_f1', 'exact_fbeta2', 'proximity_macro_fbeta2']  # Changed from 'sklearn_fbeta2'
+
+    for key in key_metrics:
+        if finetuned_metrics[key] > binary_metrics[key]:
+            winner_count['finetuned'] += 1
+        else:
+            winner_count['binary'] += 1
+
+    if winner_count['finetuned'] > winner_count['binary']:
+        print("🏆 Fine-tuned model performs better on key metrics (F1, F-beta scores)")
+    else:
+        print("🏆 Binary model performs better on key metrics (F1, F-beta scores)")
+
+    return binary_metrics, finetuned_metrics
+
+def unified_evaluation():
+    """Main evaluation function on complete test set"""
+    """Main evaluation function on complete test set"""
+
+    # Configuration
+    TEST_FILE = './test_segments.csv'
+    TOLERANCE = 5
+
+    print(f"Loading test data from: {TEST_FILE}")
+    test_df = pd.read_csv(TEST_FILE)
+    print(f"Test set size: {len(test_df)} segments")
+
+    # Calculate test set statistics
+    total_tokens = 0
+    total_switches = 0
+    for idx in range(len(test_df)):
+        labels = [int(l) for l in test_df.iloc[idx]['labels'].split(',')]
+        total_tokens += len(labels)
+        total_switches += sum(1 for l in labels if l in [2, 3])
+
+    print(f"Total tokens in test set: {total_tokens}")
+    print(f"Total switches in test set: {total_switches}")
+    print(f"Average switches per segment: {total_switches / len(test_df):.2f}\n")
+
+    # Load Binary Model
+    print("Loading Binary Model...")
+    binary_tokenizer = AutoTokenizer.from_pretrained('./alloauto/web/model')
+    binary_session = ort.InferenceSession('./alloauto/web/model/onnx/model.onnx')
+
+    # Load Fine-tuned Model
+    print("Loading Fine-tuned Model...")
+    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+    ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
+    ft_model.eval()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ft_model = ft_model.to(device)
+    print(f"Using device: {device}\n")
+
+    # Process all test segments
+    print("Processing all test segments...")
+    all_true_labels = []
+    binary_all_pred = []
+    finetuned_all_pred = []
+
+    for idx, row in test_df.iterrows():
+        if idx % 20 == 0:
+            print(f"  Processing segment {idx}/{len(test_df)}...")
+
+        tokens = row['tokens'].split()
+        true_labels = [int(l) for l in row['labels'].split(',')]
+
+        # Get predictions from both models
+        # Use the corrected sentence-level function for binary model
+        binary_pred = process_binary_model_sentence_level(tokens, binary_tokenizer, binary_session)
+        ft_pred = process_finetuned_model(tokens, ft_tokenizer, ft_model, device)
+
+        # Align all to same length
+        min_len = min(len(true_labels), len(binary_pred), len(ft_pred))
+
+        all_true_labels.extend(true_labels[:min_len])
+        binary_all_pred.extend(binary_pred[:min_len])
+        finetuned_all_pred.extend(ft_pred[:min_len])
+
+    print(f"\nTotal tokens evaluated: {len(all_true_labels)}")
+    print(f"Ground truth switches: {sum(1 for l in all_true_labels if l in [2, 3])}")
+    print(f"Binary predicted switches: {sum(1 for l in binary_all_pred if l in [2, 3])}")
+    print(f"Fine-tuned predicted switches: {sum(1 for l in finetuned_all_pred if l in [2, 3])}")
+
+    # Calculate metrics for both models
+    print("\nCalculating metrics...")
+    binary_metrics = evaluate_switch_detection_with_proximity(all_true_labels, binary_all_pred, TOLERANCE)
+    finetuned_metrics = evaluate_switch_detection_with_proximity(all_true_labels, finetuned_all_pred, TOLERANCE)
+
+    ####
+    # binary_metrics = evaluate_switch_detection_with_proximity(all_true_labels, binary_all_pred, TOLERANCE)
+    # finetuned_metrics = evaluate_switch_detection_with_proximity(all_true_labels, finetuned_all_pred, TOLERANCE)
+
+    # Print comprehensive results
+    print(f"\n{'=' * 100}")
+    print("COMPREHENSIVE EVALUATION RESULTS")
+    print(f"{'=' * 100}")
+
+    print(f"\n{'─' * 100}")
+    print("PROXIMITY-BASED METRICS (5-token tolerance)")
+    print(f"{'─' * 100}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print("-" * 100)
+
+    proximity_metrics = [
+        ('Precision (w/ tolerance)', 'proximity_precision'),
+        ('Recall (w/ tolerance)', 'proximity_recall'),
+        ('F1 (w/ tolerance)', 'proximity_f1'),
+    ]
+
+    for display, key in proximity_metrics:
+        b_val = binary_metrics[key]
+        f_val = finetuned_metrics[key]
+        diff = f_val - b_val
+        print(f"{display:<30} {b_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+
+    print(f"\n{'─' * 100}")
+    print("EXACT METRICS (sklearn - no tolerance)")
+    print(f"{'─' * 100}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print("-" * 100)
+    exact_metrics = [
+        ('Precision (exact)', 'exact_precision'),  # Changed from 'sklearn_precision'
+        ('Recall (exact)', 'exact_recall'),  # Changed from 'sklearn_recall'
+        ('F1 (exact)', 'exact_f1'),  # Changed from 'sklearn_f1'
+        ('F-beta(2) (exact)', 'exact_fbeta2'),  # Changed from 'sklearn_fbeta2'
+    ]
+
+    # Also update the key_metrics list in the winner selection:
+    key_metrics = ['proximity_f1', 'exact_fbeta2', 'proximity_macro_fbeta2']  # Changed from 'sklearn_fbeta2'
+
+    for display, key in exact_metrics:
+        b_val = binary_metrics[key]
+        f_val = finetuned_metrics[key]
+        diff = f_val - b_val
+        print(f"{display:<30} {b_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+
+    print(f"\n{'─' * 100}")
+    print("MACRO METRICS (average of switch types)")
+    print(f"{'─' * 100}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print("-" * 100)
+
+    macro_metrics = [
+        ('Macro Precision', 'macro_precision'),
+        ('Macro Recall', 'macro_recall'),
+        ('Macro F1', 'macro_f1'),
+        ('Macro F-beta(2)', 'macro_fbeta2'),
+    ]
+
+    for display, key in macro_metrics:
+        b_val = binary_metrics[key]
+        f_val = finetuned_metrics[key]
+        diff = f_val - b_val
+        print(f"{display:<30} {b_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+
+    print(f"\n{'─' * 100}")
+    print("PER-TYPE F-BETA(2) SCORES")
+    print(f"{'─' * 100}")
+    print(f"{'Switch Type':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print("-" * 100)
+
+    print(f"{'Switch→Auto F-beta(2)':<30} {binary_metrics['to_auto_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_auto_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_auto_fbeta2'] - binary_metrics['to_auto_fbeta2']:+20.3f}")
+    print(f"{'Switch→Allo F-beta(2)':<30} {binary_metrics['to_allo_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_allo_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_allo_fbeta2'] - binary_metrics['to_allo_fbeta2']:+20.3f}")
+
+    print(f"\n{'─' * 100}")
+    print("COUNT STATISTICS")
+    print(f"{'─' * 100}")
+    print(f"{'Statistic':<30} {'Binary Model':<20} {'Fine-tuned Model':<20}")
+    print("-" * 100)
+
+    count_stats = [
+        ('True Switches', 'true_switches'),
+        ('Predicted Switches', 'pred_switches'),
+        ('Exact Matches', 'exact_matches'),
+        ('Proximity Matches', 'proximity_matches'),
+        ('True Switch→Auto', 'true_to_auto'),
+        ('True Switch→Allo', 'true_to_allo'),
+        ('Pred Switch→Auto', 'pred_to_auto'),
+        ('Pred Switch→Allo', 'pred_to_allo'),
+    ]
+
+    for display, key in count_stats:
+        b_val = binary_metrics[key]
+        f_val = finetuned_metrics[key]
+        print(f"{display:<30} {b_val:<20} {f_val:<20}")
+
+    # Summary winner
+    print(f"\n{'=' * 100}")
+    print("SUMMARY")
+    print(f"{'=' * 100}")
+
+    winner_count = {'binary': 0, 'finetuned': 0}
+
+    # key_metrics = ['proximity_f1', 'sklearn_fbeta2', 'macro_fbeta2']
+    key_metrics = ['proximity_f1', 'exact_fbeta2', 'proximity_macro_fbeta2']  # Changed from 'sklearn_fbeta2'
+
+    for key in key_metrics:
+        if finetuned_metrics[key] > binary_metrics[key]:
+            winner_count['finetuned'] += 1
+        else:
+            winner_count['binary'] += 1
+
+    if winner_count['finetuned'] > winner_count['binary']:
+        print("🏆 Fine-tuned model performs better on key metrics (F1, F-beta scores)")
+    else:
+        print("🏆 Binary model performs better on key metrics (F1, F-beta scores)")
+
+    return binary_metrics, finetuned_metrics
+
+def show_detailed_comparisons(test_df, binary_tokenizer, binary_session, ft_tokenizer, ft_model, num_examples=5):
+    """Show detailed side-by-side comparisons of model predictions"""
+
+    device = next(ft_model.parameters()).device
+    label_names = {
+        0: 'Auto',
+        1: 'Allo',
+        2: '→AUTO',
+        3: '→ALLO'
+    }
+
+    print("\n" + "=" * 100)
+    print("DETAILED SEGMENT COMPARISONS")
+    print("=" * 100)
+
+    # Sample random examples
+    sample_indices = np.random.choice(len(test_df), min(num_examples, len(test_df)), replace=False)
+
+    for ex_num, idx in enumerate(sample_indices):
+        row = test_df.iloc[idx]
+        tokens = row['tokens'].split()
+        true_labels = [int(l) for l in row['labels'].split(',')]
+
+        # Get predictions from both models
+        binary_pred = process_binary_model(tokens, binary_tokenizer, binary_session)
+        ft_pred = process_finetuned_model(tokens, ft_tokenizer, ft_model, device)
+
+        # Align to same length
+        min_len = min(len(tokens), len(true_labels), len(binary_pred), len(ft_pred))
+        tokens = tokens[:min_len]
+        true_labels = true_labels[:min_len]
+        binary_pred = binary_pred[:min_len]
+        ft_pred = ft_pred[:min_len]
+
+        print(f"\n{'─' * 100}")
+        print(f"EXAMPLE {ex_num + 1} - File: {row['source_file'][:50]}...")
+        print(f"Segment length: {len(tokens)} tokens")
+
+        # Count switches
+        true_switches = sum(1 for l in true_labels if l in [2, 3])
+        binary_switches = sum(1 for l in binary_pred if l in [2, 3])
+        ft_switches = sum(1 for l in ft_pred if l in [2, 3])
+
+        print(f"\nSwitch counts:")
+        print(f"  Ground truth: {true_switches} switches")
+        print(f"  Binary model: {binary_switches} switches")
+        print(f"  Fine-tuned:   {ft_switches} switches")
+
+        # Show first 30 tokens in detail
+        print(f"\nDetailed token-by-token comparison (first 30 tokens):")
+        print(f"{'Pos':<5} {'Token':<20} {'True':<8} {'Binary':<8} {'Fine-tuned':<12} {'Match'}")
+        print("─" * 70)
+
+        for i in range(min(30, len(tokens))):
+            token = tokens[i][:19]
+            true_lab = label_names[true_labels[i]]
+            binary_lab = label_names[binary_pred[i]]
+            ft_lab = label_names[ft_pred[i]]
+
+            # Highlight switches
+            if true_labels[i] in [2, 3]:
+                token = f"*{token}*"
+
+            # Check if predictions match truth
+            binary_match = "✓" if binary_pred[i] == true_labels[i] else "✗"
+            ft_match = "✓" if ft_pred[i] == true_labels[i] else "✗"
+
+            print(f"[{i:3d}] {token:<20} {true_lab:<8} {binary_lab:<8}{binary_match} {ft_lab:<12}{ft_match}")
+
+        # Show switch regions specifically
+        switch_positions = [i for i, l in enumerate(true_labels) if l in [2, 3]]
+        if switch_positions and len(switch_positions) <= 10:
+            print(f"\nDetailed view at switch points:")
+            for switch_pos in switch_positions[:5]:  # Show first 5 switches
+                print(f"\n  Switch at position {switch_pos}:")
+                start = max(0, switch_pos - 2)
+                end = min(len(tokens), switch_pos + 3)
+
+                for pos in range(start, end):
+                    marker = ">>>" if pos == switch_pos else "   "
+                    token = tokens[pos][:15]
+                    true_lab = label_names[true_labels[pos]]
+                    binary_lab = label_names[binary_pred[pos]]
+                    ft_lab = label_names[ft_pred[pos]]
+
+                    print(f"    {marker} [{pos:3d}] {token:<15} True:{true_lab:<8} Bin:{binary_lab:<8} FT:{ft_lab}")
+
+
+def print_fbeta_comparison(binary_metrics, finetuned_metrics):
+    """Print comprehensive F-beta(2) comparison with per-class metrics (5-token tolerance)"""
+
+    print("\n" + "=" * 120)
+    print("COMPREHENSIVE F-BETA(2) AND PER-CLASS COMPARISON WITH 5-TOKEN TOLERANCE")
+    print("=" * 120)
+
+    # Overall metrics with tolerance
+    print("\n" + "─" * 120)
+    print("OVERALL METRICS (5-token tolerance)")
+    print("─" * 120)
+    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print("-" * 120)
+
+    # Overall F-beta(2)
+    print(f"{'F-beta(2)':<20} {binary_metrics['proximity_fbeta2']:<25.3f} "
+          f"{finetuned_metrics['proximity_fbeta2']:<25.3f} "
+          f"{finetuned_metrics['proximity_fbeta2'] - binary_metrics['proximity_fbeta2']:+20.3f}")
+
+    # Overall Precision and Recall
+    print(f"{'Precision':<20} {binary_metrics['proximity_precision']:<25.3f} "
+          f"{finetuned_metrics['proximity_precision']:<25.3f} "
+          f"{finetuned_metrics['proximity_precision'] - binary_metrics['proximity_precision']:+20.3f}")
+
+    print(f"{'Recall':<20} {binary_metrics['proximity_recall']:<25.3f} "
+          f"{finetuned_metrics['proximity_recall']:<25.3f} "
+          f"{finetuned_metrics['proximity_recall'] - binary_metrics['proximity_recall']:+20.3f}")
+
+    print(f"{'F1':<20} {binary_metrics['proximity_f1']:<25.3f} "
+          f"{finetuned_metrics['proximity_f1']:<25.3f} "
+          f"{finetuned_metrics['proximity_f1'] - binary_metrics['proximity_f1']:+20.3f}")
+
+    # Per-class metrics with tolerance
+    print("\n" + "─" * 120)
+    print("PER-CLASS METRICS: SWITCH→AUTO (with 5-token tolerance)")
+    print("─" * 120)
+    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print("-" * 120)
+
+    # Use the values directly from metrics dictionary OR calculate from counts
+    # For Switch→Auto
+    if 'to_auto_proximity_precision' in binary_metrics:
+        b_auto_precision = binary_metrics['to_auto_proximity_precision']
+    else:
+        # Calculate from matched counts
+        b_auto_precision = (binary_metrics.get('matched_to_auto', 0) /
+                            binary_metrics['pred_to_auto'] if binary_metrics.get('pred_to_auto', 0) > 0 else 0)
+
+    if 'to_auto_proximity_precision' in finetuned_metrics:
+        f_auto_precision = finetuned_metrics['to_auto_proximity_precision']
+    else:
+        f_auto_precision = (finetuned_metrics.get('matched_to_auto', 0) /
+                            finetuned_metrics['pred_to_auto'] if finetuned_metrics.get('pred_to_auto', 0) > 0 else 0)
+
+    if 'to_auto_proximity_recall' in binary_metrics:
+        b_auto_recall = binary_metrics['to_auto_proximity_recall']
+    else:
+        b_auto_recall = (binary_metrics.get('matched_to_auto', 0) /
+                         binary_metrics['true_to_auto'] if binary_metrics.get('true_to_auto', 0) > 0 else 0)
+
+    if 'to_auto_proximity_recall' in finetuned_metrics:
+        f_auto_recall = finetuned_metrics['to_auto_proximity_recall']
+    else:
+        f_auto_recall = (finetuned_metrics.get('matched_to_auto', 0) /
+                         finetuned_metrics['true_to_auto'] if finetuned_metrics.get('true_to_auto', 0) > 0 else 0)
+
+    print(f"{'F-beta(2)':<20} {binary_metrics.get('to_auto_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_auto_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_auto_proximity_fbeta2', 0) - binary_metrics.get('to_auto_proximity_fbeta2', 0):+20.3f}")
+
+    print(f"{'Precision':<20} {b_auto_precision:<25.3f} "
+          f"{f_auto_precision:<25.3f} "
+          f"{f_auto_precision - b_auto_precision:+20.3f}")
+
+    print(f"{'Recall':<20} {b_auto_recall:<25.3f} "
+          f"{f_auto_recall:<25.3f} "
+          f"{f_auto_recall - b_auto_recall:+20.3f}")
+
+    # F1 for Switch→Auto
+    b_auto_f1 = 2 * b_auto_precision * b_auto_recall / (b_auto_precision + b_auto_recall) if (
+                                                                                                         b_auto_precision + b_auto_recall) > 0 else 0
+    f_auto_f1 = 2 * f_auto_precision * f_auto_recall / (f_auto_precision + f_auto_recall) if (
+                                                                                                         f_auto_precision + f_auto_recall) > 0 else 0
+
+    print(f"{'F1':<20} {b_auto_f1:<25.3f} "
+          f"{f_auto_f1:<25.3f} "
+          f"{f_auto_f1 - b_auto_f1:+20.3f}")
+
+    print(f"{'Support (count)':<20} {binary_metrics.get('true_to_auto', 0):<25} "
+          f"{finetuned_metrics.get('true_to_auto', 0):<25} "
+          f"{'(same test set)':<20}")
+
+    print("\n" + "─" * 120)
+    print("PER-CLASS METRICS: SWITCH→ALLO (with 5-token tolerance)")
+    print("─" * 120)
+    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print("-" * 120)
+
+    # For Switch→Allo
+    if 'to_allo_proximity_precision' in binary_metrics:
+        b_allo_precision = binary_metrics['to_allo_proximity_precision']
+    else:
+        b_allo_precision = (binary_metrics.get('matched_to_allo', 0) /
+                            binary_metrics['pred_to_allo'] if binary_metrics.get('pred_to_allo', 0) > 0 else 0)
+
+    if 'to_allo_proximity_precision' in finetuned_metrics:
+        f_allo_precision = finetuned_metrics['to_allo_proximity_precision']
+    else:
+        f_allo_precision = (finetuned_metrics.get('matched_to_allo', 0) /
+                            finetuned_metrics['pred_to_allo'] if finetuned_metrics.get('pred_to_allo', 0) > 0 else 0)
+
+    if 'to_allo_proximity_recall' in binary_metrics:
+        b_allo_recall = binary_metrics['to_allo_proximity_recall']
+    else:
+        b_allo_recall = (binary_metrics.get('matched_to_allo', 0) /
+                         binary_metrics['true_to_allo'] if binary_metrics.get('true_to_allo', 0) > 0 else 0)
+
+    if 'to_allo_proximity_recall' in finetuned_metrics:
+        f_allo_recall = finetuned_metrics['to_allo_proximity_recall']
+    else:
+        f_allo_recall = (finetuned_metrics.get('matched_to_allo', 0) /
+                         finetuned_metrics['true_to_allo'] if finetuned_metrics.get('true_to_allo', 0) > 0 else 0)
+
+    print(f"{'F-beta(2)':<20} {binary_metrics.get('to_allo_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_allo_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_allo_proximity_fbeta2', 0) - binary_metrics.get('to_allo_proximity_fbeta2', 0):+20.3f}")
+
+    print(f"{'Precision':<20} {b_allo_precision:<25.3f} "
+          f"{f_allo_precision:<25.3f} "
+          f"{f_allo_precision - b_allo_precision:+20.3f}")
+
+    print(f"{'Recall':<20} {b_allo_recall:<25.3f} "
+          f"{f_allo_recall:<25.3f} "
+          f"{f_allo_recall - b_allo_recall:+20.3f}")
+
+    # F1 for Switch→Allo
+    b_allo_f1 = 2 * b_allo_precision * b_allo_recall / (b_allo_precision + b_allo_recall) if (
+                                                                                                         b_allo_precision + b_allo_recall) > 0 else 0
+    f_allo_f1 = 2 * f_allo_precision * f_allo_recall / (f_allo_precision + f_allo_recall) if (
+                                                                                                         f_allo_precision + f_allo_recall) > 0 else 0
+
+    print(f"{'F1':<20} {b_allo_f1:<25.3f} "
+          f"{f_allo_f1:<25.3f} "
+          f"{f_allo_f1 - b_allo_f1:+20.3f}")
+
+    print(f"{'Support (count)':<20} {binary_metrics.get('true_to_allo', 0):<25} "
+          f"{finetuned_metrics.get('true_to_allo', 0):<25} "
+          f"{'(same test set)':<20}")
+
+    # [Rest of the function remains the same...]
+
+def print_fbeta_comparison_v1(binary_metrics, finetuned_metrics):
+    """Print comprehensive F-beta(2) comparison with per-class metrics (5-token tolerance)"""
+
+    print("\n" + "=" * 120)
+    print("COMPREHENSIVE F-BETA(2) AND PER-CLASS COMPARISON WITH 5-TOKEN TOLERANCE")
+    print("=" * 120)
+
+    # Overall metrics with tolerance
+    print("\n" + "─" * 120)
+    print("OVERALL METRICS (5-token tolerance)")
+    print("─" * 120)
+    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print("-" * 120)
+
+    # Overall F-beta(2)
+    print(f"{'F-beta(2)':<20} {binary_metrics['proximity_fbeta2']:<25.3f} "
+          f"{finetuned_metrics['proximity_fbeta2']:<25.3f} "
+          f"{finetuned_metrics['proximity_fbeta2'] - binary_metrics['proximity_fbeta2']:+20.3f}")
+
+    # Overall Precision and Recall
+    print(f"{'Precision':<20} {binary_metrics['proximity_precision']:<25.3f} "
+          f"{finetuned_metrics['proximity_precision']:<25.3f} "
+          f"{finetuned_metrics['proximity_precision'] - binary_metrics['proximity_precision']:+20.3f}")
+
+    print(f"{'Recall':<20} {binary_metrics['proximity_recall']:<25.3f} "
+          f"{finetuned_metrics['proximity_recall']:<25.3f} "
+          f"{finetuned_metrics['proximity_recall'] - binary_metrics['proximity_recall']:+20.3f}")
+
+    print(f"{'F1':<20} {binary_metrics['proximity_f1']:<25.3f} "
+          f"{finetuned_metrics['proximity_f1']:<25.3f} "
+          f"{finetuned_metrics['proximity_f1'] - binary_metrics['proximity_f1']:+20.3f}")
+
+    # Per-class metrics with tolerance
+    print("\n" + "─" * 120)
+    print("PER-CLASS METRICS: SWITCH→AUTO (with 5-token tolerance)")
+    print("─" * 120)
+    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print("-" * 120)
+
+    # Calculate per-class metrics for Switch→Auto
+    b_auto_precision = binary_metrics.get('to_auto_proximity_precision',
+                                          0) if 'to_auto_proximity_precision' in binary_metrics else (
+        len([1 for i in range(len(binary_metrics.get('matched_to_auto', [])))]) /
+        binary_metrics['pred_to_auto'] if binary_metrics.get('pred_to_auto', 0) > 0 else 0
+    )
+    f_auto_precision = finetuned_metrics.get('to_auto_proximity_precision',
+                                             0) if 'to_auto_proximity_precision' in finetuned_metrics else (
+        len([1 for i in range(len(finetuned_metrics.get('matched_to_auto', [])))]) /
+        finetuned_metrics['pred_to_auto'] if finetuned_metrics.get('pred_to_auto', 0) > 0 else 0
+    )
+
+    b_auto_recall = binary_metrics.get('to_auto_proximity_recall',
+                                       0) if 'to_auto_proximity_recall' in binary_metrics else (
+        len([1 for i in range(len(binary_metrics.get('matched_to_auto', [])))]) /
+        binary_metrics['true_to_auto'] if binary_metrics.get('true_to_auto', 0) > 0 else 0
+    )
+    f_auto_recall = finetuned_metrics.get('to_auto_proximity_recall',
+                                          0) if 'to_auto_proximity_recall' in finetuned_metrics else (
+        len([1 for i in range(len(finetuned_metrics.get('matched_to_auto', [])))]) /
+        finetuned_metrics['true_to_auto'] if finetuned_metrics.get('true_to_auto', 0) > 0 else 0
+    )
+
+    print(f"{'F-beta(2)':<20} {binary_metrics.get('to_auto_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_auto_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_auto_proximity_fbeta2', 0) - binary_metrics.get('to_auto_proximity_fbeta2', 0):+20.3f}")
+
+    print(f"{'Precision':<20} {b_auto_precision:<25.3f} "
+          f"{f_auto_precision:<25.3f} "
+          f"{f_auto_precision - b_auto_precision:+20.3f}")
+
+    print(f"{'Recall':<20} {b_auto_recall:<25.3f} "
+          f"{f_auto_recall:<25.3f} "
+          f"{f_auto_recall - b_auto_recall:+20.3f}")
+
+    # F1 for Switch→Auto
+    b_auto_f1 = 2 * b_auto_precision * b_auto_recall / (b_auto_precision + b_auto_recall) if (
+                                                                                                         b_auto_precision + b_auto_recall) > 0 else 0
+    f_auto_f1 = 2 * f_auto_precision * f_auto_recall / (f_auto_precision + f_auto_recall) if (
+                                                                                                         f_auto_precision + f_auto_recall) > 0 else 0
+
+    print(f"{'F1':<20} {b_auto_f1:<25.3f} "
+          f"{f_auto_f1:<25.3f} "
+          f"{f_auto_f1 - b_auto_f1:+20.3f}")
+
+    # Support (count of true instances)
+    print(f"{'Support (count)':<20} {binary_metrics.get('true_to_auto', 0):<25} "
+          f"{finetuned_metrics.get('true_to_auto', 0):<25} "
+          f"{'(same test set)':<20}")
+
+    print("\n" + "─" * 120)
+    print("PER-CLASS METRICS: SWITCH→ALLO (with 5-token tolerance)")
+    print("─" * 120)
+    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print("-" * 120)
+
+    # Calculate per-class metrics for Switch→Allo
+    b_allo_precision = binary_metrics.get('to_allo_proximity_precision',
+                                          0) if 'to_allo_proximity_precision' in binary_metrics else (
+        len([1 for i in range(len(binary_metrics.get('matched_to_allo', [])))]) /
+        binary_metrics['pred_to_allo'] if binary_metrics.get('pred_to_allo', 0) > 0 else 0
+    )
+    f_allo_precision = finetuned_metrics.get('to_allo_proximity_precision',
+                                             0) if 'to_allo_proximity_precision' in finetuned_metrics else (
+        len([1 for i in range(len(finetuned_metrics.get('matched_to_allo', [])))]) /
+        finetuned_metrics['pred_to_allo'] if finetuned_metrics.get('pred_to_allo', 0) > 0 else 0
+    )
+
+    b_allo_recall = binary_metrics.get('to_allo_proximity_recall',
+                                       0) if 'to_allo_proximity_recall' in binary_metrics else (
+        len([1 for i in range(len(binary_metrics.get('matched_to_allo', [])))]) /
+        binary_metrics['true_to_allo'] if binary_metrics.get('true_to_allo', 0) > 0 else 0
+    )
+    f_allo_recall = finetuned_metrics.get('to_allo_proximity_recall',
+                                          0) if 'to_allo_proximity_recall' in finetuned_metrics else (
+        len([1 for i in range(len(finetuned_metrics.get('matched_to_allo', [])))]) /
+        finetuned_metrics['true_to_allo'] if finetuned_metrics.get('true_to_allo', 0) > 0 else 0
+    )
+
+    print(f"{'F-beta(2)':<20} {binary_metrics.get('to_allo_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_allo_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_allo_proximity_fbeta2', 0) - binary_metrics.get('to_allo_proximity_fbeta2', 0):+20.3f}")
+
+    print(f"{'Precision':<20} {b_allo_precision:<25.3f} "
+          f"{f_allo_precision:<25.3f} "
+          f"{f_allo_precision - b_allo_precision:+20.3f}")
+
+    print(f"{'Recall':<20} {b_allo_recall:<25.3f} "
+          f"{f_allo_recall:<25.3f} "
+          f"{f_allo_recall - b_allo_recall:+20.3f}")
+
+    # F1 for Switch→Allo
+    b_allo_f1 = 2 * b_allo_precision * b_allo_recall / (b_allo_precision + b_allo_recall) if (
+                                                                                                         b_allo_precision + b_allo_recall) > 0 else 0
+    f_allo_f1 = 2 * f_allo_precision * f_allo_recall / (f_allo_precision + f_allo_recall) if (
+                                                                                                         f_allo_precision + f_allo_recall) > 0 else 0
+
+    print(f"{'F1':<20} {b_allo_f1:<25.3f} "
+          f"{f_allo_f1:<25.3f} "
+          f"{f_allo_f1 - b_allo_f1:+20.3f}")
+
+    # Support (count of true instances)
+    print(f"{'Support (count)':<20} {binary_metrics.get('true_to_allo', 0):<25} "
+          f"{finetuned_metrics.get('true_to_allo', 0):<25} "
+          f"{'(same test set)':<20}")
+
+    # Macro averages
+    print("\n" + "─" * 120)
+    print("MACRO AVERAGES (average of both switch types)")
+    print("─" * 120)
+    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print("-" * 120)
+
+    print(f"{'Macro F-beta(2)':<20} {binary_metrics['proximity_macro_fbeta2']:<25.3f} "
+          f"{finetuned_metrics['proximity_macro_fbeta2']:<25.3f} "
+          f"{finetuned_metrics['proximity_macro_fbeta2'] - binary_metrics['proximity_macro_fbeta2']:+20.3f}")
+
+    macro_b_precision = (b_auto_precision + b_allo_precision) / 2
+    macro_f_precision = (f_auto_precision + f_allo_precision) / 2
+    macro_b_recall = (b_auto_recall + b_allo_recall) / 2
+    macro_f_recall = (f_auto_recall + f_allo_recall) / 2
+    macro_b_f1 = (b_auto_f1 + b_allo_f1) / 2
+    macro_f_f1 = (f_auto_f1 + f_allo_f1) / 2
+
+    print(f"{'Macro Precision':<20} {macro_b_precision:<25.3f} "
+          f"{macro_f_precision:<25.3f} "
+          f"{macro_f_precision - macro_b_precision:+20.3f}")
+
+    print(f"{'Macro Recall':<20} {macro_b_recall:<25.3f} "
+          f"{macro_f_recall:<25.3f} "
+          f"{macro_f_recall - macro_b_recall:+20.3f}")
+
+    print(f"{'Macro F1':<20} {macro_b_f1:<25.3f} "
+          f"{macro_f_f1:<25.3f} "
+          f"{macro_f_f1 - macro_b_f1:+20.3f}")
+
+    # Winner determination
+    print("\n" + "=" * 120)
+    print("VERDICT")
+    print("=" * 120)
+
+    improvement = ((finetuned_metrics['proximity_fbeta2'] - binary_metrics['proximity_fbeta2']) /
+                   max(binary_metrics['proximity_fbeta2'], 0.001)) * 100 if binary_metrics[
+                                                                                'proximity_fbeta2'] > 0 else float(
+        'inf')
+
+    if finetuned_metrics['proximity_fbeta2'] > binary_metrics['proximity_fbeta2']:
+        print(f"🏆 Fine-tuned model wins with:")
+        print(
+            f"   - F-beta(2) score {finetuned_metrics['proximity_fbeta2'] - binary_metrics['proximity_fbeta2']:.3f} higher")
+        print(f"   - {improvement:.1f}% relative improvement")
+        print(f"   - Better performance on both Switch→Auto and Switch→Allo detection")
+    elif binary_metrics['proximity_fbeta2'] > finetuned_metrics['proximity_fbeta2']:
+        print(
+            f"🏆 Binary model wins with F-beta(2) score {binary_metrics['proximity_fbeta2'] - finetuned_metrics['proximity_fbeta2']:.3f} higher")
+    else:
+        print("🤝 Both models perform equally")
+def print_fbeta_comparison_old(binary_metrics, finetuned_metrics):
+    """Print focused F-beta(2) comparison with tolerance"""
+
+    print("\n" + "=" * 100)
+    print("F-BETA(2) COMPARISON WITH 5-TOKEN TOLERANCE")
+    print("(Beta=2 emphasizes recall over precision)")
+    print("=" * 100)
+
+    # Overall F-beta(2) with tolerance
+    print("\n" + "─" * 100)
+    print("OVERALL F-BETA(2) SCORES (5-token tolerance)")
+    print("─" * 100)
+
+    b_fbeta = binary_metrics['proximity_fbeta2']
+    f_fbeta = finetuned_metrics['proximity_fbeta2']
+    improvement = ((f_fbeta - b_fbeta) / max(b_fbeta, 0.001)) * 100 if b_fbeta > 0 else float('inf')
+
+    print(f"Binary Model F-beta(2):      {b_fbeta:.3f}")
+    print(f"Fine-tuned Model F-beta(2):  {f_fbeta:.3f}")
+    print(f"Absolute Improvement:        {f_fbeta - b_fbeta:+.3f}")
+    print(f"Relative Improvement:        {improvement:.1f}%")
+
+    # Per-type F-beta(2) with tolerance
+    print("\n" + "─" * 100)
+    print("PER-TYPE F-BETA(2) SCORES (5-token tolerance)")
+    print("─" * 100)
+
+    print(f"\n{'Switch Type':<20} {'Binary':<15} {'Fine-tuned':<15} {'Difference':<15}")
+    print("-" * 65)
+
+    print(f"{'Switch→Auto':<20} {binary_metrics['to_auto_proximity_fbeta2']:<15.3f} "
+          f"{finetuned_metrics['to_auto_proximity_fbeta2']:<15.3f} "
+          f"{finetuned_metrics['to_auto_proximity_fbeta2'] - binary_metrics['to_auto_proximity_fbeta2']:+15.3f}")
+
+    print(f"{'Switch→Allo':<20} {binary_metrics['to_allo_proximity_fbeta2']:<15.3f} "
+          f"{finetuned_metrics['to_allo_proximity_fbeta2']:<15.3f} "
+          f"{finetuned_metrics['to_allo_proximity_fbeta2'] - binary_metrics['to_allo_proximity_fbeta2']:+15.3f}")
+
+    # Macro F-beta(2) with tolerance
+    print(f"{'Macro Average':<20} {binary_metrics['proximity_macro_fbeta2']:<15.3f} "
+          f"{finetuned_metrics['proximity_macro_fbeta2']:<15.3f} "
+          f"{finetuned_metrics['proximity_macro_fbeta2'] - binary_metrics['proximity_macro_fbeta2']:+15.3f}")
+
+    # Supporting metrics for context
+    print("\n" + "─" * 100)
+    print("SUPPORTING METRICS (with 5-token tolerance)")
+    print("─" * 100)
+
+    print(f"\n{'Metric':<20} {'Binary':<15} {'Fine-tuned':<15} {'Difference':<15}")
+    print("-" * 65)
+
+    print(f"{'Precision':<20} {binary_metrics['proximity_precision']:<15.3f} "
+          f"{finetuned_metrics['proximity_precision']:<15.3f} "
+          f"{finetuned_metrics['proximity_precision'] - binary_metrics['proximity_precision']:+15.3f}")
+
+    print(f"{'Recall':<20} {binary_metrics['proximity_recall']:<15.3f} "
+          f"{finetuned_metrics['proximity_recall']:<15.3f} "
+          f"{finetuned_metrics['proximity_recall'] - binary_metrics['proximity_recall']:+15.3f}")
+
+    # Winner determination based on F-beta(2)
+    print("\n" + "=" * 100)
+    print("VERDICT (based on F-beta(2) with tolerance)")
+    print("=" * 100)
+
+    if finetuned_metrics['proximity_fbeta2'] > binary_metrics['proximity_fbeta2']:
+        diff = finetuned_metrics['proximity_fbeta2'] - binary_metrics['proximity_fbeta2']
+        print(f"🏆 Fine-tuned model wins with F-beta(2) score {diff:.3f} higher")
+    elif binary_metrics['proximity_fbeta2'] > finetuned_metrics['proximity_fbeta2']:
+        diff = binary_metrics['proximity_fbeta2'] - finetuned_metrics['proximity_fbeta2']
+        print(f"🏆 Binary model wins with F-beta(2) score {diff:.3f} higher")
+    else:
+        print("🤝 Both models perform equally")
+
+
+def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session, ft_tokenizer, ft_model,
+                                      num_examples=3):
+    """Show detailed side-by-side comparisons of model predictions"""
+
+    device = next(ft_model.parameters()).device
+
+    # Label mapping for display
+    label_symbols = {
+        0: '○',  # Auto continuation
+        1: '●',  # Allo continuation
+        2: '→○',  # Switch to Auto
+        3: '→●'  # Switch to Allo
+    }
+
+    label_colors = {
+        0: '\033[94m',  # Blue for Auto
+        1: '\033[91m',  # Red for Allo
+        2: '\033[92m',  # Green for Switch to Auto
+        3: '\033[93m',  # Yellow for Switch to Allo
+    }
+    RESET = '\033[0m'
+
+    print("\n" + "=" * 120)
+    print("DETAILED SEGMENT-BY-SEGMENT COMPARISON")
+    print("=" * 120)
+    print("Legend: ○=Auto  ●=Allo  →○=Switch-to-Auto  →●=Switch-to-Allo")
+    print("=" * 120)
+
+    # Sample random segments
+    sample_indices = np.random.choice(len(test_df), min(num_examples, len(test_df)), replace=False)
+
+    for ex_num, idx in enumerate(sample_indices, 1):
+        row = test_df.iloc[idx]
+        tokens = row['tokens'].split()
+        true_labels = [int(l) for l in row['labels'].split(',')]
+
+        # Get predictions
+        binary_pred = process_binary_model_sentence_level(tokens, binary_tokenizer, binary_session)
+        ft_pred = process_finetuned_model(tokens, ft_tokenizer, ft_model, device)
+
+        # Align lengths
+        min_len = min(len(tokens), len(true_labels), len(binary_pred), len(ft_pred))
+        tokens = tokens[:min_len]
+        true_labels = true_labels[:min_len]
+        binary_pred = binary_pred[:min_len]
+        ft_pred = ft_pred[:min_len]
+
+        print(f"\n{'─' * 120}")
+        print(f"SEGMENT {ex_num} | File: {row['source_file'][:60]}...")
+        print(f"Length: {len(tokens)} tokens | True switches: {sum(1 for l in true_labels if l in [2, 3])}")
+        print(f"{'─' * 120}")
+
+        # Calculate metrics for this segment
+        seg_binary_metrics = evaluate_switch_detection_with_proximity(true_labels, binary_pred, tolerance=5)
+        seg_ft_metrics = evaluate_switch_detection_with_proximity(true_labels, ft_pred, tolerance=5)
+
+        print(f"\nSegment Metrics:")
+        print(f"  Binary Model - F-beta(2): {seg_binary_metrics['proximity_fbeta2']:.3f} | "
+              f"Precision: {seg_binary_metrics['proximity_precision']:.3f} | "
+              f"Recall: {seg_binary_metrics['proximity_recall']:.3f}")
+        print(f"  Fine-tuned   - F-beta(2): {seg_ft_metrics['proximity_fbeta2']:.3f} | "
+              f"Precision: {seg_ft_metrics['proximity_precision']:.3f} | "
+              f"Recall: {seg_ft_metrics['proximity_recall']:.3f}")
+
+        # Show in chunks of 10 tokens for readability
+        print(f"\nToken-by-token comparison (showing first 50 tokens):")
+        print(f"{'─' * 120}")
+
+        for start_idx in range(0, min(50, len(tokens)), 10):
+            end_idx = min(start_idx + 10, len(tokens))
+
+            # Token row
+            print(f"Tokens [{start_idx:3d}-{end_idx - 1:3d}]: ", end='')
+            for i in range(start_idx, end_idx):
+                token_display = tokens[i][:8].ljust(10)
+                print(f"{token_display}", end='')
+            print()
+
+            # True labels row
+            print(f"True Labels:     ", end='')
+            for i in range(start_idx, end_idx):
+                label = true_labels[i]
+                symbol = label_symbols[label].ljust(10)
+                print(f"{label_colors.get(label, '')}{symbol}{RESET}", end='')
+            print()
+
+            # Binary predictions row
+            print(f"Binary Pred:     ", end='')
+            for i in range(start_idx, end_idx):
+                label = binary_pred[i]
+                symbol = label_symbols[label].ljust(10)
+                match = "✓" if binary_pred[i] == true_labels[i] else " "
+                print(f"{label_colors.get(label, '')}{symbol}{RESET}", end='')
+            print()
+
+            # Fine-tuned predictions row
+            print(f"Fine-tuned:      ", end='')
+            for i in range(start_idx, end_idx):
+                label = ft_pred[i]
+                symbol = label_symbols[label].ljust(10)
+                match = "✓" if ft_pred[i] == true_labels[i] else " "
+                print(f"{label_colors.get(label, '')}{symbol}{RESET}", end='')
+            print()
+
+            print()  # Empty line between chunks
+
+        # Highlight switch regions specifically
+        true_switches = [(i, true_labels[i]) for i in range(len(true_labels)) if true_labels[i] in [2, 3]]
+        if true_switches and len(true_switches) <= 5:
+            print(f"\nSwitch Regions Detail:")
+            print(f"{'─' * 80}")
+
+            for switch_idx, switch_type in true_switches[:3]:
+                switch_name = "Switch→Auto" if switch_type == 2 else "Switch→Allo"
+                print(f"\n{switch_name} at position {switch_idx}:")
+
+                start = max(0, switch_idx - 2)
+                end = min(len(tokens), switch_idx + 3)
+
+                print(f"  {'Position':<8} {'Token':<15} {'True':<12} {'Binary':<12} {'Fine-tuned':<12}")
+                print(f"  {'-' * 70}")
+
+                for pos in range(start, end):
+                    marker = ">>>" if pos == switch_idx else "   "
+                    token = tokens[pos][:14]
+                    true_sym = label_symbols[true_labels[pos]]
+                    binary_sym = label_symbols[binary_pred[pos]]
+                    ft_sym = label_symbols[ft_pred[pos]]
+
+                    binary_match = "✓" if binary_pred[pos] == true_labels[pos] else "✗"
+                    ft_match = "✓" if ft_pred[pos] == true_labels[pos] else "✗"
+
+                    print(f"  {marker} [{pos:3d}] {token:<15} {true_sym:<12} "
+                          f"{binary_sym:<10}{binary_match} {ft_sym:<10}{ft_match}")
+
+
+def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session, ft_tokenizer, ft_model,
+                                      num_examples=3):
+    """Show detailed side-by-side comparisons with actual label names"""
+
+    device = next(ft_model.parameters()).device
+
+    # Label names for display
+    label_names = {
+        0: 'Auto',
+        1: 'Allo',
+        2: '→AUTO',
+        3: '→ALLO'
+    }
+
+    print("\n" + "=" * 120)
+    print("DETAILED SEGMENT-BY-SEGMENT COMPARISON")
+    print("=" * 120)
+
+    # Sample random segments
+    sample_indices = np.random.choice(len(test_df), min(num_examples, len(test_df)), replace=False)
+
+    for ex_num, idx in enumerate(sample_indices, 1):
+        row = test_df.iloc[idx]
+        tokens = row['tokens'].split()
+        true_labels = [int(l) for l in row['labels'].split(',')]
+
+        # Get predictions
+        binary_pred = process_binary_model_sentence_level(tokens, binary_tokenizer, binary_session)
+        ft_pred = process_finetuned_model(tokens, ft_tokenizer, ft_model, device)
+
+        # Align lengths
+        min_len = min(len(tokens), len(true_labels), len(binary_pred), len(ft_pred))
+        tokens = tokens[:min_len]
+        true_labels = true_labels[:min_len]
+        binary_pred = binary_pred[:min_len]
+        ft_pred = ft_pred[:min_len]
+
+        print(f"\n{'─' * 120}")
+        print(f"SEGMENT {ex_num} | File: {row['source_file'][:60]}...")
+        print(f"Length: {len(tokens)} tokens | True switches: {sum(1 for l in true_labels if l in [2, 3])}")
+        print(f"{'─' * 120}")
+
+        # Calculate metrics for this segment
+        seg_binary_metrics = evaluate_switch_detection_with_proximity(true_labels, binary_pred, tolerance=5)
+        seg_ft_metrics = evaluate_switch_detection_with_proximity(true_labels, ft_pred, tolerance=5)
+
+        print(f"\nSegment Metrics:")
+        print(f"  Binary Model - F-beta(2): {seg_binary_metrics['proximity_fbeta2']:.3f} | "
+              f"Precision: {seg_binary_metrics['proximity_precision']:.3f} | "
+              f"Recall: {seg_binary_metrics['proximity_recall']:.3f}")
+        print(f"  Fine-tuned   - F-beta(2): {seg_ft_metrics['proximity_fbeta2']:.3f} | "
+              f"Precision: {seg_ft_metrics['proximity_precision']:.3f} | "
+              f"Recall: {seg_ft_metrics['proximity_recall']:.3f}")
+
+        # Show detailed comparison
+        print(f"\nToken-by-token comparison (showing first 40 tokens):")
+        print(f"{'─' * 120}")
+        print(f"{'Pos':<5} {'Token':<15} {'True Label':<10} {'Binary Pred':<12} {'Fine-tuned':<12} {'Match'}")
+        print(f"{'─' * 120}")
+
+        for i in range(min(40, len(tokens))):
+            token = tokens[i][:14]
+            true_label = label_names[true_labels[i]]
+            binary_label = label_names[binary_pred[i]]
+            ft_label = label_names[ft_pred[i]]
+
+            # Check matches
+            binary_match = "✓" if binary_pred[i] == true_labels[i] else "✗"
+            ft_match = "✓" if ft_pred[i] == true_labels[i] else "✓"
+
+            # Highlight switch points
+            if true_labels[i] in [2, 3]:
+                print(
+                    f"[{i:3d}] {token:<15} **{true_label:<10} {binary_label:<10}{binary_match}  {ft_label:<10}{ft_match}")
+            else:
+                print(
+                    f"[{i:3d}] {token:<15} {true_label:<10} {binary_label:<10}{binary_match}  {ft_label:<10}{ft_match}")
+
+        # Show switch regions in detail
+        true_switches = [(i, true_labels[i]) for i in range(len(true_labels)) if true_labels[i] in [2, 3]]
+
+        if true_switches:
+            print(f"\n{'─' * 120}")
+            print(f"DETAILED VIEW AT SWITCH POINTS:")
+            print(f"{'─' * 120}")
+
+            for switch_idx, switch_type in true_switches[:5]:  # Show first 5 switches
+                print(f"\nSwitch at position {switch_idx}: {label_names[switch_type]}")
+
+                start = max(0, switch_idx - 3)
+                end = min(len(tokens), switch_idx + 4)
+
+                print(f"{'Pos':<8} {'Token':<15} {'True':<10} {'Binary':<10} {'Fine-tuned':<10}")
+                print("-" * 60)
+
+                for pos in range(start, end):
+                    marker = ">>>" if pos == switch_idx else "   "
+                    token = tokens[pos][:14]
+                    true_label = label_names[true_labels[pos]]
+                    binary_label = label_names[binary_pred[pos]]
+                    ft_label = label_names[ft_pred[pos]]
+
+                    if pos == switch_idx:
+                        # Highlight the switch point
+                        print(f"{marker} [{pos:3d}] {token:<15} {true_label:<10} {binary_label:<10} {ft_label:<10}")
+                    else:
+                        print(f"    [{pos:3d}] {token:<15} {true_label:<10} {binary_label:<10} {ft_label:<10}")
+
+        # Summary for this segment
+        print(f"\n{'─' * 120}")
+        print(f"Summary for Segment {ex_num}:")
+        true_auto_switches = sum(1 for l in true_labels if l == 2)
+        true_allo_switches = sum(1 for l in true_labels if l == 3)
+        binary_auto_switches = sum(1 for l in binary_pred if l == 2)
+        binary_allo_switches = sum(1 for l in binary_pred if l == 3)
+        ft_auto_switches = sum(1 for l in ft_pred if l == 2)
+        ft_allo_switches = sum(1 for l in ft_pred if l == 3)
+
+        print(f"  True Labels:    {true_auto_switches} →AUTO, {true_allo_switches} →ALLO")
+        print(f"  Binary Model:   {binary_auto_switches} →AUTO, {binary_allo_switches} →ALLO")
+        print(f"  Fine-tuned:     {ft_auto_switches} →AUTO, {ft_allo_switches} →ALLO")
+
+
+# Call this after your main evaluation
+if __name__ == "__main__":
+    # Run main evaluation
+    binary_metrics, finetuned_metrics = unified_evaluation()
+
+    # Print F-beta comparison
+    print_fbeta_comparison(binary_metrics, finetuned_metrics)
+
+    # Load models for detailed comparison
+    print("\n\nLoading models for detailed segment comparisons...")
+
+    TEST_FILE = './test_segments.csv'
+    test_df = pd.read_csv(TEST_FILE)
+
+    binary_tokenizer = AutoTokenizer.from_pretrained('./alloauto/web/model')
+    binary_session = ort.InferenceSession('./alloauto/web/model/onnx/model.onnx')
+
+    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+    ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
+    ft_model.eval()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ft_model = ft_model.to(device)
+
+    # Show detailed comparisons
+    show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
+                                      ft_tokenizer, ft_model, num_examples=3)
+# # Add this function call after your main evaluation
+# if __name__ == "__main__":
+#     # Run main evaluation
+#     binary_metrics, finetuned_metrics = unified_evaluation()
+#
+#     # Print F-beta comparison
+#     print_fbeta_comparison(binary_metrics, finetuned_metrics)
+#
+#     # Load models for detailed comparison
+#     print("\n\nLoading models for detailed segment comparisons...")
+#
+#     TEST_FILE = './test_segments.csv'
+#     test_df = pd.read_csv(TEST_FILE)
+#
+#     binary_tokenizer = AutoTokenizer.from_pretrained('./alloauto/web/model')
+#     binary_session = ort.InferenceSession('./alloauto/web/model/onnx/model.onnx')
+#
+#     model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+#     ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
+#     ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
+#     ft_model.eval()
+#
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     ft_model = ft_model.to(device)
+#
+#     # Show detailed comparisons
+#     show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
+#                                       ft_tokenizer, ft_model, num_examples=3)
+# # Call this at the end of your evaluation
+# if __name__ == "__main__":
+#     binary_metrics, finetuned_metrics = unified_evaluation()
+#     print_fbeta_comparison(binary_metrics, finetuned_metrics)
+#
+# # Call this function after calculating metrics in unified_evaluation:
+# if __name__ == "__main__":
+#     binary_metrics, finetuned_metrics = unified_evaluation()
+#
+#     # Add the detailed comparisons
+#     print("\nLoading models for detailed comparison...")
+#     binary_tokenizer = AutoTokenizer.from_pretrained('./alloauto/web/model')
+#     binary_session = ort.InferenceSession('./alloauto/web/model/onnx/model.onnx')
+#
+#     model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+#     ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
+#     ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
+#     ft_model.eval()
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     ft_model = ft_model.to(device)
+#
+#     test_df = pd.read_csv('./test_segments.csv')
+#     show_detailed_comparisons(test_df, binary_tokenizer, binary_session, ft_tokenizer, ft_model, num_examples=5)
+# #
+# # if __name__ == "__main__":
+#     binary_metrics, finetuned_metrics = unified_evaluation()
+#     print(f"\n{'─' * 100}")
+#     print("F-BETA(2) COMPARISON - PROXIMITY vs EXACT")
+#     print(f"{'─' * 100}")
+#     print(f"{'Metric':<40} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+#     print("-" * 100)
+#
+#     # Show both proximity and exact F-beta(2)
+#     print(f"{'F-beta(2) WITH 5-token tolerance':<40} {binary_metrics['proximity_fbeta2']:<20.3f} "
+#           f"{finetuned_metrics['proximity_fbeta2']:<20.3f} "
+#           f"{finetuned_metrics['proximity_fbeta2'] - binary_metrics['proximity_fbeta2']:+20.3f}")
+#
+#     print(f"{'F-beta(2) EXACT (no tolerance)':<40} {binary_metrics['exact_fbeta2']:<20.3f} "
+#           f"{finetuned_metrics['exact_fbeta2']:<20.3f} "
+#           f"{finetuned_metrics['exact_fbeta2'] - binary_metrics['exact_fbeta2']:+20.3f}")
+#
+#     print(f"{'Macro F-beta(2) WITH tolerance':<40} {binary_metrics['proximity_macro_fbeta2']:<20.3f} "
+#           f"{finetuned_metrics['proximity_macro_fbeta2']:<20.3f} "
+#           f"{finetuned_metrics['proximity_macro_fbeta2'] - binary_metrics['proximity_macro_fbeta2']:+20.3f}")
+#
+#     print(f"{'Macro F-beta(2) EXACT':<40} {binary_metrics['exact_macro_fbeta2']:<20.3f} "
+#           f"{finetuned_metrics['exact_macro_fbeta2']:<20.3f} "
+#           f"{finetuned_metrics['exact_macro_fbeta2'] - binary_metrics['exact_macro_fbeta2']:+20.3f}")
