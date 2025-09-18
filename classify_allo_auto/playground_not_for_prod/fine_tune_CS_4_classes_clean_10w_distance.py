@@ -8,7 +8,7 @@ Classes:
 
 Focus: Proximity-aware loss and evaluation with 5-token tolerance
 """
-#MOST updated model! 18/9/2025"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -825,7 +825,7 @@ class ProximityAwareLoss4Class(nn.Module):
     Loss function with logical transition constraints
     """
 
-    def __init__(self, switch_loss_weight=30.0, proximity_tolerance=5,
+    def __init__(self, switch_loss_weight=30.0, proximity_tolerance=10,
                  distance_decay=0.7, false_positive_penalty=10.0,
                  invalid_transition_penalty=100.0):
         super().__init__()
@@ -974,7 +974,7 @@ class ProximityAwareLoss4Class(nn.Module):
 # PART 4: PROXIMITY-AWARE METRICS
 # ============================================================================
 
-def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance=5):
+def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance=10):
     """
     Evaluate switch detection with proximity tolerance and TYPE matching
     Switch types must match: class 2 with class 2, class 3 with class 3
@@ -1081,7 +1081,7 @@ def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance
     }
 
 
-def compute_metrics_for_trainer(eval_pred, tolerance=5):
+def compute_metrics_for_trainer(eval_pred, tolerance=10):
     """
     Compute metrics for the trainer with proximity awareness and TYPE matching
     """
@@ -1133,7 +1133,7 @@ def compute_metrics_for_trainer(eval_pred, tolerance=5):
 class ProximityAwareTrainer4Class(Trainer):
     """Custom trainer with proximity-aware loss and transition constraints"""
 
-    def __init__(self, switch_loss_weight=30.0, proximity_tolerance=5,
+    def __init__(self, switch_loss_weight=30.0, proximity_tolerance=10,
                  distance_decay=0.7, false_positive_penalty=10.0,
                  invalid_transition_penalty=100.0, *args, **kwargs):
         # Handle tokenizer/processing_class
@@ -1195,7 +1195,7 @@ class ProximityAwareTrainer4Class(Trainer):
 # ============================================================================
 
 def print_test_examples_with_constraints(model, tokenizer, test_csv='test_segments.csv',
-                                        num_examples=5, tolerance=5):
+                                        num_examples=5, tolerance=10):
     """
     Print test examples showing effect of logical constraints
     """
@@ -1349,7 +1349,7 @@ def print_test_examples_with_constraints(model, tokenizer, test_csv='test_segmen
 
 # Add this after print_test_examples_with_constraints function:
 def print_test_examples_proximity(model, tokenizer, test_csv='test_segments.csv',
-                                 num_examples=5, tolerance=5):
+                                 num_examples=5, tolerance=10):
     """
     Print detailed test examples with proximity-aware evaluation
     Shows TYPE-specific switch matching
@@ -1363,9 +1363,76 @@ def print_test_examples_proximity(model, tokenizer, test_csv='test_segments.csv'
 # ============================================================================
 
 def train_tibetan_code_switching():
+    # """
+    # Main training pipeline with logical transition constraints
+    # """
+    # print("=" * 60)
+    # print("TIBETAN CODE-SWITCHING DETECTION TRAINING")
+    # print("With Proximity-Aware Loss (5-token tolerance)")
+    # print("With Logical Transition Constraints")
+    # print("=" * 60)
+    #
+    # # Step 1: Process all files
+    # print("\nSTEP 1: Processing files...")
+    # data_dir = 'classify_allo_auto/data'
+    #
+    # if not os.path.exists(data_dir):
+    #     print(f"ERROR: Data directory {data_dir} not found!")
+    #     return
+    #
+    # df, all_segments = process_all_files(data_dir)
+    #
+    # if len(df) == 0:
+    #     print("ERROR: No segments with transitions found!")
+    #     return
+    #
+    # # Save processed data
+    # df.to_csv('all_segments_300_400_tokens.csv', index=False)
+    #
+    # # Step 2: Create train/val/test split with better file diversity
+    # print("\nSTEP 2: Creating train/val/test split with file diversity...")
+    # train_df, val_df, test_df = create_train_val_test_split(df)
+    #
+    # # Step 3: Initialize model with better configuration
+    # print("\nSTEP 3: Initializing model...")
+    # # model_name = 'bert-base-multilingual-cased'
+    # model_name = 'OMRIDRORI/mbert-tibetan-continual-wylie-final'
+    # # output_dir = './tibetan_code_switching_constrained_model_bert-base-multilingual-cased'
+    # output_dir = './tibetan_code_switching_constrained_model_wylie-final_all_data'
+    #
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # print(f"Using device: {device}")
+    #
+    # tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # model = AutoModelForTokenClassification.from_pretrained(
+    #     model_name,
+    #     num_labels=4,
+    #     label2id={'non_switch_auto': 0, 'non_switch_allo': 1, 'to_auto': 2, 'to_allo': 3},
+    #     id2label={0: 'non_switch_auto', 1: 'non_switch_allo', 2: 'to_auto', 3: 'to_allo'},
+    #     hidden_dropout_prob=0.3,  # Add dropout for regularization
+    #     attention_probs_dropout_prob=0.3
+    # )
+    #
+    # # Initialize with balanced bias for both switch types
+    # with torch.no_grad():
+    #     model.classifier.bias.data[0] = 0.0   # Non-switch auto
+    #     model.classifier.bias.data[1] = 0.0   # Non-switch allo
+    #     model.classifier.bias.data[2] = -1.0  # Switch to auto (slight negative bias)
+    #     model.classifier.bias.data[3] = -1.0  # Switch to allo (same as auto for balance)
+    #
+    # model = model.to(device)
+    #
+    # # Step 4: Create datasets
+    # print("\nSTEP 4: Creating datasets...")
+    # train_dataset = CodeSwitchingDataset4Class('train_segments.csv', tokenizer)
+    # val_dataset = CodeSwitchingDataset4Class('val_segments.csv', tokenizer)
+    # test_dataset = CodeSwitchingDataset4Class('test_segments.csv', tokenizer)
+    #
+    # data_collator = DataCollatorForTokenClassification(tokenizer)
+    #########
     """
         Main training pipeline with logical transition constraints
-    """
+        """
     print("=" * 60)
     print("TIBETAN CODE-SWITCHING DETECTION TRAINING")
     print("With Proximity-Aware Loss (5-token tolerance)")
@@ -1431,7 +1498,7 @@ def train_tibetan_code_switching():
     # model_name = 'bert-base-multilingual-cased'
     model_name = 'OMRIDRORI/mbert-tibetan-continual-wylie-final'
     # output_dir = './tibetan_code_switching_constrained_model_bert-base-multilingual-cased'
-    output_dir = './tibetan_code_switching_constrained_model_wylie-final_all_data'
+    output_dir = './tibetan_code_switching_constrained_model_wylie-final_all_data_tol_10w'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1520,7 +1587,8 @@ def train_tibetan_code_switching():
         label_smoothing_factor=0.05,  # Reduced smoothing
         gradient_checkpointing=True,
         push_to_hub=True,  # Enable pushing to HF
-        hub_model_id="levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data",  # Your HF repo
+        # hub_model_id="levshechter/tibetan-CS-detesctor_bert-base-multilingual-cased",  # Your HF repo
+        hub_model_id="levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_tol_10w",  # Your HF repo
     )
 
     # Custom trainer with logical constraints
@@ -1533,7 +1601,7 @@ def train_tibetan_code_switching():
         processing_class=tokenizer,
         compute_metrics=lambda eval_pred: compute_metrics_for_trainer(eval_pred, tolerance=5),
         switch_loss_weight=max(to_auto_weight, to_allo_weight),  # Use higher weight
-        proximity_tolerance=5,
+        proximity_tolerance=10,
         distance_decay=0.7,
         false_positive_penalty=10.0,
         invalid_transition_penalty=100.0  # Very high penalty for invalid transitions,
