@@ -84,7 +84,7 @@
       const heatmapDiv = document.getElementById("heatmap");
       outputDiv.innerHTML = "";
       heatmapDiv.innerHTML = "";
-      const API_BASE = `http://${location.hostname}:8001`;
+      const API_BASE = `http://${location.hostname}:8002`;
       const resp = await fetch(`${API_BASE}/classify-chunks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
