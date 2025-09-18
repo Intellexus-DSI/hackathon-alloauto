@@ -45,6 +45,193 @@ for i in range(torch.cuda.device_count()):
 # PART 1: DATA PROCESSING
 # ============================================================================
 
+
+def analyze_and_balance_switch_distribution(train_df, val_df, test_df):
+    """
+    Analyze switch type distribution and check balance
+    """
+    print("\n" + "=" * 80)
+    print("SWITCH TYPE DISTRIBUTION ANALYSIS")
+    print("=" * 80)
+
+    def get_switch_stats(df, split_name):
+        """Get detailed switch statistics for a split"""
+        total_to_auto = 0
+        total_to_allo = 0
+        segments_with_auto = 0
+        segments_with_allo = 0
+
+        for idx in range(len(df)):
+            labels = [int(l) for l in df.iloc[idx]['labels'].split(',')]
+
+            # Count switches in this segment
+            to_auto_count = labels.count(2)
+            to_allo_count = labels.count(3)
+
+            total_to_auto += to_auto_count
+            total_to_allo += to_allo_count
+
+            if to_auto_count > 0:
+                segments_with_auto += 1
+            if to_allo_count > 0:
+                segments_with_allo += 1
+
+        total_switches = total_to_auto + total_to_allo
+
+        stats = {
+            'split': split_name,
+            'n_segments': len(df),
+            'total_switches': total_switches,
+            'to_auto': total_to_auto,
+            'to_allo': total_to_allo,
+            'auto_pct': (total_to_auto / total_switches * 100) if total_switches > 0 else 0,
+            'allo_pct': (total_to_allo / total_switches * 100) if total_switches > 0 else 0,
+            'avg_switches_per_seg': total_switches / len(df) if len(df) > 0 else 0,
+            'avg_auto_per_seg': total_to_auto / len(df) if len(df) > 0 else 0,
+            'avg_allo_per_seg': total_to_allo / len(df) if len(df) > 0 else 0,
+            'segs_with_auto': segments_with_auto,
+            'segs_with_allo': segments_with_allo
+        }
+        return stats
+
+    # Get stats for each split
+    train_stats = get_switch_stats(train_df, 'Train')
+    val_stats = get_switch_stats(val_df, 'Val')
+    test_stats = get_switch_stats(test_df, 'Test')
+
+    # Print detailed statistics
+    print("\n📊 DETAILED STATISTICS BY SPLIT:\n")
+    print(f"{'Split':<8} {'Segments':<10} {'Total SW':<10} {'→Auto':<10} {'→Allo':<10} {'Auto%':<10} {'Allo%':<10}")
+    print("-" * 70)
+
+    for stats in [train_stats, val_stats, test_stats]:
+        print(f"{stats['split']:<8} {stats['n_segments']:<10} {stats['total_switches']:<10} "
+              f"{stats['to_auto']:<10} {stats['to_allo']:<10} "
+              f"{stats['auto_pct']:<10.1f} {stats['allo_pct']:<10.1f}")
+
+    print("\n📈 AVERAGE SWITCHES PER SEGMENT:\n")
+    print(f"{'Split':<8} {'Avg Total':<12} {'Avg →Auto':<12} {'Avg →Allo':<12}")
+    print("-" * 45)
+
+    for stats in [train_stats, val_stats, test_stats]:
+        print(f"{stats['split']:<8} {stats['avg_switches_per_seg']:<12.2f} "
+              f"{stats['avg_auto_per_seg']:<12.2f} {stats['avg_allo_per_seg']:<12.2f}")
+
+    print("\n📑 SEGMENT COVERAGE:\n")
+    print(f"{'Split':<8} {'Has →Auto':<15} {'Has →Allo':<15}")
+    print("-" * 40)
+
+    for stats in [train_stats, val_stats, test_stats]:
+        print(f"{stats['split']:<8} {stats['segs_with_auto']}/{stats['n_segments']:<10} "
+              f"{stats['segs_with_allo']}/{stats['n_segments']}")
+
+    # Check for distribution imbalance
+    auto_pcts = [train_stats['auto_pct'], val_stats['auto_pct'], test_stats['auto_pct']]
+    allo_pcts = [train_stats['allo_pct'], val_stats['allo_pct'], test_stats['allo_pct']]
+
+    max_auto_diff = max(auto_pcts) - min(auto_pcts)
+    max_allo_diff = max(allo_pcts) - min(allo_pcts)
+
+    print("\n⚖️ DISTRIBUTION BALANCE CHECK:")
+    print(f"  Max difference in Auto%: {max_auto_diff:.1f}%")
+    print(f"  Max difference in Allo%: {max_allo_diff:.1f}%")
+    print(f"  Train vs Test Auto% difference: {abs(train_stats['auto_pct'] - test_stats['auto_pct']):.1f}%")
+    print(f"  Train vs Test Allo% difference: {abs(train_stats['allo_pct'] - test_stats['allo_pct']):.1f}%")
+
+    if max_auto_diff > 5 or max_allo_diff > 5:
+        print("  ⚠️ WARNING: Imbalanced distribution detected (>5% difference)")
+        print("  Consider using stratified splitting based on switch types")
+    else:
+        print("  ✅ Distribution is well balanced across splits")
+
+    return train_stats, val_stats, test_stats
+
+
+def create_stratified_switch_split(df, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
+    """
+    Create stratified split that maintains switch type distribution
+    """
+    print("\n" + "=" * 80)
+    print("CREATING STRATIFIED SPLIT BY SWITCH TYPE")
+    print("=" * 80)
+
+    # Calculate switch type ratio for each segment
+    segment_features = []
+
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        labels = [int(l) for l in row['labels'].split(',')]
+
+        to_auto = labels.count(2)
+        to_allo = labels.count(3)
+        total_switches = to_auto + to_allo
+
+        # Categorize segments by dominant switch type
+        if total_switches == 0:
+            category = 'no_switch'  # Shouldn't happen with your filtering
+        elif to_auto > 0 and to_allo == 0:
+            category = 'auto_only'
+        elif to_allo > 0 and to_auto == 0:
+            category = 'allo_only'
+        elif to_auto > to_allo:
+            category = 'auto_dominant'
+        elif to_allo > to_auto:
+            category = 'allo_dominant'
+        else:
+            category = 'balanced'
+
+        segment_features.append({
+            'idx': idx,
+            'category': category,
+            'to_auto': to_auto,
+            'to_allo': to_allo,
+            'auto_ratio': to_auto / total_switches if total_switches > 0 else 0
+        })
+
+    # Add category to dataframe
+    df['switch_category'] = [sf['category'] for sf in segment_features]
+
+    # Print category distribution
+    print("\nSegment categories:")
+    category_counts = df['switch_category'].value_counts()
+    for cat, count in category_counts.items():
+        print(f"  {cat}: {count} segments ({count / len(df) * 100:.1f}%)")
+
+    # Stratified split by category
+    # First split: train+val vs test
+    train_val_df, test_df = train_test_split(
+        df,
+        test_size=test_ratio,
+        stratify=df['switch_category'],
+        random_state=42
+    )
+
+    # Second split: train vs val
+    relative_val_size = val_ratio / (train_ratio + val_ratio)
+    train_df, val_df = train_test_split(
+        train_val_df,
+        test_size=relative_val_size,
+        stratify=train_val_df['switch_category'],
+        random_state=42
+    )
+
+    # Remove temporary column
+    train_df = train_df.drop('switch_category', axis=1)
+    val_df = val_df.drop('switch_category', axis=1)
+    test_df = test_df.drop('switch_category', axis=1)
+
+    # Save splits
+    train_df.to_csv('train_segments_stratified.csv', index=False)
+    val_df.to_csv('val_segments_stratified.csv', index=False)
+    test_df.to_csv('test_segments_stratified.csv', index=False)
+
+    print(f"\n✅ Stratified splits created:")
+    print(f"  Train: {len(train_df)} segments")
+    print(f"  Val: {len(val_df)} segments")
+    print(f"  Test: {len(test_df)} segments")
+
+    return train_df, val_df, test_df
+
 def clean_and_normalize_text(text_content):
     """
     Clean text and normalize tags, remove ALL newlines and extra spaces
@@ -1176,9 +1363,76 @@ def print_test_examples_proximity(model, tokenizer, test_csv='test_segments.csv'
 # ============================================================================
 
 def train_tibetan_code_switching():
+    # """
+    # Main training pipeline with logical transition constraints
+    # """
+    # print("=" * 60)
+    # print("TIBETAN CODE-SWITCHING DETECTION TRAINING")
+    # print("With Proximity-Aware Loss (5-token tolerance)")
+    # print("With Logical Transition Constraints")
+    # print("=" * 60)
+    #
+    # # Step 1: Process all files
+    # print("\nSTEP 1: Processing files...")
+    # data_dir = 'classify_allo_auto/data'
+    #
+    # if not os.path.exists(data_dir):
+    #     print(f"ERROR: Data directory {data_dir} not found!")
+    #     return
+    #
+    # df, all_segments = process_all_files(data_dir)
+    #
+    # if len(df) == 0:
+    #     print("ERROR: No segments with transitions found!")
+    #     return
+    #
+    # # Save processed data
+    # df.to_csv('all_segments_300_400_tokens.csv', index=False)
+    #
+    # # Step 2: Create train/val/test split with better file diversity
+    # print("\nSTEP 2: Creating train/val/test split with file diversity...")
+    # train_df, val_df, test_df = create_train_val_test_split(df)
+    #
+    # # Step 3: Initialize model with better configuration
+    # print("\nSTEP 3: Initializing model...")
+    # # model_name = 'bert-base-multilingual-cased'
+    # model_name = 'OMRIDRORI/mbert-tibetan-continual-wylie-final'
+    # # output_dir = './tibetan_code_switching_constrained_model_bert-base-multilingual-cased'
+    # output_dir = './tibetan_code_switching_constrained_model_wylie-final_all_data'
+    #
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # print(f"Using device: {device}")
+    #
+    # tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # model = AutoModelForTokenClassification.from_pretrained(
+    #     model_name,
+    #     num_labels=4,
+    #     label2id={'non_switch_auto': 0, 'non_switch_allo': 1, 'to_auto': 2, 'to_allo': 3},
+    #     id2label={0: 'non_switch_auto', 1: 'non_switch_allo', 2: 'to_auto', 3: 'to_allo'},
+    #     hidden_dropout_prob=0.3,  # Add dropout for regularization
+    #     attention_probs_dropout_prob=0.3
+    # )
+    #
+    # # Initialize with balanced bias for both switch types
+    # with torch.no_grad():
+    #     model.classifier.bias.data[0] = 0.0   # Non-switch auto
+    #     model.classifier.bias.data[1] = 0.0   # Non-switch allo
+    #     model.classifier.bias.data[2] = -1.0  # Switch to auto (slight negative bias)
+    #     model.classifier.bias.data[3] = -1.0  # Switch to allo (same as auto for balance)
+    #
+    # model = model.to(device)
+    #
+    # # Step 4: Create datasets
+    # print("\nSTEP 4: Creating datasets...")
+    # train_dataset = CodeSwitchingDataset4Class('train_segments.csv', tokenizer)
+    # val_dataset = CodeSwitchingDataset4Class('val_segments.csv', tokenizer)
+    # test_dataset = CodeSwitchingDataset4Class('test_segments.csv', tokenizer)
+    #
+    # data_collator = DataCollatorForTokenClassification(tokenizer)
+    #########
     """
-    Main training pipeline with logical transition constraints
-    """
+        Main training pipeline with logical transition constraints
+        """
     print("=" * 60)
     print("TIBETAN CODE-SWITCHING DETECTION TRAINING")
     print("With Proximity-Aware Loss (5-token tolerance)")
@@ -1187,7 +1441,8 @@ def train_tibetan_code_switching():
 
     # Step 1: Process all files
     print("\nSTEP 1: Processing files...")
-    data_dir = 'classify_allo_auto/data'
+    data_dir = 'dataset/all data'
+    # data_dir = 'classify_allo_auto/data'
 
     if not os.path.exists(data_dir):
         print(f"ERROR: Data directory {data_dir} not found!")
@@ -1206,10 +1461,44 @@ def train_tibetan_code_switching():
     print("\nSTEP 2: Creating train/val/test split with file diversity...")
     train_df, val_df, test_df = create_train_val_test_split(df)
 
+    # NEW: Analyze switch distribution
+    print("\n" + "=" * 60)
+    print("ANALYZING SWITCH DISTRIBUTION IN SPLITS")
+    print("=" * 60)
+    train_stats, val_stats, test_stats = analyze_and_balance_switch_distribution(
+        train_df, val_df, test_df
+    )
+
+    # NEW: Create stratified split if distribution is imbalanced
+    if abs(train_stats['auto_pct'] - test_stats['auto_pct']) > 5 or \
+            abs(train_stats['allo_pct'] - test_stats['allo_pct']) > 5:
+        print("\n" + "=" * 60)
+        print("CREATING BETTER STRATIFIED SPLIT DUE TO IMBALANCE")
+        print("=" * 60)
+        train_df, val_df, test_df = create_stratified_switch_split(df)
+
+        # Re-analyze the stratified split
+        print("\n📊 VERIFYING STRATIFIED SPLIT:")
+        train_stats, val_stats, test_stats = analyze_and_balance_switch_distribution(
+            train_df, val_df, test_df
+        )
+
+        # Use stratified files
+        train_dataset_file = 'train_segments_stratified.csv'
+        val_dataset_file = 'val_segments_stratified.csv'
+        test_dataset_file = 'test_segments_stratified.csv'
+    else:
+        print("\n✅ Distribution is balanced, using original splits")
+        train_dataset_file = 'train_segments.csv'
+        val_dataset_file = 'val_segments.csv'
+        test_dataset_file = 'test_segments.csv'
+
     # Step 3: Initialize model with better configuration
     print("\nSTEP 3: Initializing model...")
+    # model_name = 'bert-base-multilingual-cased'
     model_name = 'OMRIDRORI/mbert-tibetan-continual-wylie-final'
-    output_dir = './tibetan_code_switching_constrained_model'
+    # output_dir = './tibetan_code_switching_constrained_model_bert-base-multilingual-cased'
+    output_dir = './tibetan_code_switching_constrained_model_wylie-final_all_data'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1226,20 +1515,21 @@ def train_tibetan_code_switching():
 
     # Initialize with balanced bias for both switch types
     with torch.no_grad():
-        model.classifier.bias.data[0] = 0.0   # Non-switch auto
-        model.classifier.bias.data[1] = 0.0   # Non-switch allo
+        model.classifier.bias.data[0] = 0.0  # Non-switch auto
+        model.classifier.bias.data[1] = 0.0  # Non-switch allo
         model.classifier.bias.data[2] = -1.0  # Switch to auto (slight negative bias)
         model.classifier.bias.data[3] = -1.0  # Switch to allo (same as auto for balance)
 
     model = model.to(device)
 
-    # Step 4: Create datasets
+    # Step 4: Create datasets (using potentially stratified files)
     print("\nSTEP 4: Creating datasets...")
-    train_dataset = CodeSwitchingDataset4Class('train_segments.csv', tokenizer)
-    val_dataset = CodeSwitchingDataset4Class('val_segments.csv', tokenizer)
-    test_dataset = CodeSwitchingDataset4Class('test_segments.csv', tokenizer)
+    train_dataset = CodeSwitchingDataset4Class(train_dataset_file, tokenizer)
+    val_dataset = CodeSwitchingDataset4Class(val_dataset_file, tokenizer)
+    test_dataset = CodeSwitchingDataset4Class(test_dataset_file, tokenizer)
 
     data_collator = DataCollatorForTokenClassification(tokenizer)
+
 
     # Calculate class weights based on actual distribution
     print("\nCalculating class distribution for better weighting...")
@@ -1297,7 +1587,8 @@ def train_tibetan_code_switching():
         label_smoothing_factor=0.05,  # Reduced smoothing
         gradient_checkpointing=True,
         push_to_hub=True,  # Enable pushing to HF
-        hub_model_id="levshechter/tibetan-CS-detector",  # Your HF repo
+        # hub_model_id="levshechter/tibetan-CS-detesctor_bert-base-multilingual-cased",  # Your HF repo
+        hub_model_id="levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data",  # Your HF repo
     )
 
     # Custom trainer with logical constraints
