@@ -24,7 +24,7 @@ app.add_middleware(
     allow_credentials= False,
 )
 
-inferencer = CodeSwitchingInference4Class('levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data')
+inferencer = CodeSwitchingInference4Class('levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial')
 
 # ---------- Schemas ----------
 
