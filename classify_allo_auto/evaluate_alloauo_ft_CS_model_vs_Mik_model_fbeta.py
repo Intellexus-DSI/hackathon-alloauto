@@ -722,7 +722,8 @@ def unified_evaluation_old():
 
     # Load Fine-tuned Model
     print("Loading Fine-tuned Model...")
-    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial"
+    # model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
     ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
     ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
     ft_model.eval()
@@ -776,7 +777,7 @@ def unified_evaluation_old():
     print(f"\n{'─' * 100}")
     print("PROXIMITY-BASED METRICS (5-token tolerance)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
 
     proximity_metrics = [
@@ -794,7 +795,7 @@ def unified_evaluation_old():
     print(f"\n{'─' * 100}")
     print("EXACT METRICS (sklearn - no tolerance)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
     exact_metrics = [
         ('Precision (exact)', 'exact_precision'),  # Changed from 'sklearn_precision'
@@ -815,7 +816,7 @@ def unified_evaluation_old():
     print(f"\n{'─' * 100}")
     print("MACRO METRICS (average of switch types)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
 
     macro_metrics = [
@@ -834,7 +835,7 @@ def unified_evaluation_old():
     print(f"\n{'─' * 100}")
     print("PER-TYPE F-BETA(2) SCORES")
     print(f"{'─' * 100}")
-    print(f"{'Switch Type':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print(f"{'Switch Type':<30} {'Binary Model':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
 
     print(f"{'Switch→Auto F-beta(2)':<30} {binary_metrics['to_auto_fbeta2']:<20.3f} "
@@ -847,7 +848,7 @@ def unified_evaluation_old():
     print(f"\n{'─' * 100}")
     print("COUNT STATISTICS")
     print(f"{'─' * 100}")
-    print(f"{'Statistic':<30} {'Binary Model':<20} {'Fine-tuned Model':<20}")
+    print(f"{'Statistic':<30} {'Binary Model':<20} {'ALTO BeRT':<20}")
     print("-" * 100)
 
     count_stats = [
@@ -889,10 +890,124 @@ def unified_evaluation_old():
 
     return binary_metrics, finetuned_metrics
 
+
+import pandas as pd
+import re
+
+
+def verify_no_tags_in_datasets():
+    """
+    Verify that no <auto>, <AUTO>, <allo>, <ALLO> tags exist in the datasets
+    """
+    print("\n" + "=" * 80)
+    print("VERIFYING NO TAGS IN DATASETS")
+    print("=" * 80)
+
+    # Define tag patterns to search for
+    tag_patterns = [
+        r'<auto>',
+        r'<AUTO>',
+        r'<allo>',
+        r'<ALLO>',
+        r'<\s*auto\s*>',  # With spaces
+        r'<\s*AUTO\s*>',
+        r'<\s*allo\s*>',
+        r'<\s*ALLO\s*>'
+    ]
+
+    # Check all three dataset files
+    datasets = {
+        'Train': './train_segments.csv',
+        'Validation': './val_segments.csv',
+        'Test': './test_segments.csv'
+    }
+
+    all_clean = True
+
+    for dataset_name, filepath in datasets.items():
+        print(f"\nChecking {dataset_name} dataset: {filepath}")
+
+        try:
+            df = pd.read_csv(filepath)
+
+            # Check tokens column
+            tokens_with_tags = []
+            segments_with_tags = []
+
+            for idx, row in df.iterrows():
+                tokens = row['tokens'].split()
+
+                # Check each token for any tag pattern
+                for token_idx, token in enumerate(tokens):
+                    for pattern in tag_patterns:
+                        if re.search(pattern, token, re.IGNORECASE):
+                            tokens_with_tags.append((idx, token_idx, token))
+                            segments_with_tags.append(idx)
+                            all_clean = False
+                            break
+
+            # Also check the entire tokens string
+            for idx, row in df.iterrows():
+                tokens_str = row['tokens']
+                for pattern in tag_patterns:
+                    if re.search(pattern, tokens_str, re.IGNORECASE):
+                        if idx not in segments_with_tags:
+                            segments_with_tags.append(idx)
+                            all_clean = False
+
+            # Report findings
+            if tokens_with_tags:
+                print(f"  ⚠️ FOUND TAGS in {len(set(segments_with_tags))} segments!")
+                print(f"  First 5 occurrences:")
+                for seg_idx, token_idx, token in tokens_with_tags[:5]:
+                    print(f"    Segment {seg_idx}, Token {token_idx}: '{token}'")
+            else:
+                print(f"  ✅ No tags found in tokens")
+
+            # Check if 'original_text' column exists and verify it too
+            if 'original_text' in df.columns:
+                texts_with_tags = []
+                for idx, row in df.iterrows():
+                    if pd.notna(row['original_text']):
+                        for pattern in tag_patterns:
+                            if re.search(pattern, str(row['original_text']), re.IGNORECASE):
+                                texts_with_tags.append(idx)
+                                all_clean = False
+                                break
+
+                if texts_with_tags:
+                    print(f"  ⚠️ FOUND TAGS in original_text column in {len(texts_with_tags)} segments!")
+                    print(f"  Segments with tags: {texts_with_tags[:5]}...")
+                else:
+                    print(f"  ✅ No tags found in original_text")
+
+        except FileNotFoundError:
+            print(f"  ❌ File not found: {filepath}")
+        except Exception as e:
+            print(f"  ❌ Error reading file: {e}")
+
+    print("\n" + "=" * 80)
+    if all_clean:
+        print("✅ VERIFICATION PASSED: No tags found in any dataset!")
+    else:
+        print("⚠️ VERIFICATION FAILED: Tags found in datasets!")
+        print("Please re-run preprocessing to ensure tags are removed.")
+    print("=" * 80)
+
+    return all_clean
 def unified_evaluation():
     """Main evaluation function on complete test set"""
     """Main evaluation function on complete test set"""
+    # ADD THIS VERIFICATION FIRST
+    print("=" * 80)
+    print("VERIFYING DATASETS ARE TAG-FREE")
+    print("=" * 80)
 
+    datasets_clean = verify_no_tags_in_datasets()
+    if not datasets_clean:
+        print("\n⚠️ ERROR: Tags found in datasets!")
+        print("Please re-run preprocessing to remove tags.")
+        return None, None
     # Configuration
     TEST_FILE = './test_segments.csv'
     TOLERANCE = 5
@@ -920,7 +1035,8 @@ def unified_evaluation():
 
     # Load Fine-tuned Model
     print("Loading Fine-tuned Model...")
-    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial"
+    # model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
     ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
     ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
     ft_model.eval()
@@ -976,7 +1092,7 @@ def unified_evaluation():
     print(f"\n{'─' * 100}")
     print("PROXIMITY-BASED METRICS (5-token tolerance)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
 
     proximity_metrics = [
@@ -994,7 +1110,7 @@ def unified_evaluation():
     print(f"\n{'─' * 100}")
     print("EXACT METRICS (sklearn - no tolerance)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
     exact_metrics = [
         ('Precision (exact)', 'exact_precision'),  # Changed from 'sklearn_precision'
@@ -1015,7 +1131,7 @@ def unified_evaluation():
     print(f"\n{'─' * 100}")
     print("MACRO METRICS (average of switch types)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {'Binary Model':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
 
     macro_metrics = [
@@ -1034,7 +1150,7 @@ def unified_evaluation():
     print(f"\n{'─' * 100}")
     print("PER-TYPE F-BETA(2) SCORES")
     print(f"{'─' * 100}")
-    print(f"{'Switch Type':<30} {'Binary Model':<20} {'Fine-tuned Model':<20} {'Difference':<20}")
+    print(f"{'Switch Type':<30} {'Binary Model':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
 
     print(f"{'Switch→Auto F-beta(2)':<30} {binary_metrics['to_auto_fbeta2']:<20.3f} "
@@ -1047,7 +1163,7 @@ def unified_evaluation():
     print(f"\n{'─' * 100}")
     print("COUNT STATISTICS")
     print(f"{'─' * 100}")
-    print(f"{'Statistic':<30} {'Binary Model':<20} {'Fine-tuned Model':<20}")
+    print(f"{'Statistic':<30} {'Binary Model':<20} {'ALTO BeRT':<20}")
     print("-" * 100)
 
     count_stats = [
@@ -1188,7 +1304,7 @@ def print_fbeta_comparison(binary_metrics, finetuned_metrics):
     print("\n" + "─" * 120)
     print("OVERALL METRICS (5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {'Binary Model':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
 
     # Overall F-beta(2)
@@ -1213,7 +1329,7 @@ def print_fbeta_comparison(binary_metrics, finetuned_metrics):
     print("\n" + "─" * 120)
     print("PER-CLASS METRICS: SWITCH→AUTO (with 5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {'Binary Model':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
 
     # Use the values directly from metrics dictionary OR calculate from counts
@@ -1272,7 +1388,7 @@ def print_fbeta_comparison(binary_metrics, finetuned_metrics):
     print("\n" + "─" * 120)
     print("PER-CLASS METRICS: SWITCH→ALLO (with 5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {'Binary Model':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
 
     # For Switch→Allo
@@ -1339,7 +1455,7 @@ def print_fbeta_comparison_v1(binary_metrics, finetuned_metrics):
     print("\n" + "─" * 120)
     print("OVERALL METRICS (5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {'Binary Model':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
 
     # Overall F-beta(2)
@@ -1364,7 +1480,7 @@ def print_fbeta_comparison_v1(binary_metrics, finetuned_metrics):
     print("\n" + "─" * 120)
     print("PER-CLASS METRICS: SWITCH→AUTO (with 5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {'Binary Model':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
 
     # Calculate per-class metrics for Switch→Auto
@@ -1420,7 +1536,7 @@ def print_fbeta_comparison_v1(binary_metrics, finetuned_metrics):
     print("\n" + "─" * 120)
     print("PER-CLASS METRICS: SWITCH→ALLO (with 5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {'Binary Model':<25} {'':<25} {'Difference':<20}")
     print("-" * 120)
 
     # Calculate per-class metrics for Switch→Allo
@@ -1477,7 +1593,7 @@ def print_fbeta_comparison_v1(binary_metrics, finetuned_metrics):
     print("\n" + "─" * 120)
     print("MACRO AVERAGES (average of both switch types)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Binary Model':<25} {'Fine-tuned Model':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {'Binary Model':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
 
     print(f"{'Macro F-beta(2)':<20} {binary_metrics['proximity_macro_fbeta2']:<25.3f} "
@@ -1542,7 +1658,7 @@ def print_fbeta_comparison_old(binary_metrics, finetuned_metrics):
     improvement = ((f_fbeta - b_fbeta) / max(b_fbeta, 0.001)) * 100 if b_fbeta > 0 else float('inf')
 
     print(f"Binary Model F-beta(2):      {b_fbeta:.3f}")
-    print(f"Fine-tuned Model F-beta(2):  {f_fbeta:.3f}")
+    print(f"ALTO BeRT F-beta(2):  {f_fbeta:.3f}")
     print(f"Absolute Improvement:        {f_fbeta - b_fbeta:+.3f}")
     print(f"Relative Improvement:        {improvement:.1f}%")
 
@@ -1735,7 +1851,7 @@ def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
 
 
 def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session, ft_tokenizer, ft_model,
-                                      num_examples=3):
+                                      num_examples=10):
     """Show detailed side-by-side comparisons with actual label names"""
 
     device = next(ft_model.parameters()).device
@@ -1874,7 +1990,8 @@ if __name__ == "__main__":
     binary_tokenizer = AutoTokenizer.from_pretrained('./alloauto/web/model')
     binary_session = ort.InferenceSession('./alloauto/web/model/onnx/model.onnx')
 
-    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial"
+    # model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
     ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
     ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
     ft_model.eval()
@@ -1884,7 +2001,7 @@ if __name__ == "__main__":
 
     # Show detailed comparisons
     show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
-                                      ft_tokenizer, ft_model, num_examples=3)
+                                      ft_tokenizer, ft_model, num_examples=10)
 # # Add this function call after your main evaluation
 # if __name__ == "__main__":
 #     # Run main evaluation
