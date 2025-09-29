@@ -1257,12 +1257,6 @@ def train_and_evaluate_full_pipeline():
     trainer.save_model(f'{output_dir}/final_model')
     tokenizer.save_pretrained(f'{output_dir}/final_model')
 
-    model.push_to_hub("levshechter/tibetan-code-switching-detector")
-    tokenizer.push_to_hub("levshechter/tibetan-code-switching-detector")
-
-    # Or push the trainer (includes training args)
-    trainer.push_to_hub("levshechter/tibetan-code-switching-detector")
-
     # Step 8: Evaluate on test set with fixed evaluation
     print("\nStep 8: Evaluating on test set...")
     test_metrics, test_results = evaluate_on_test_set_fixed(

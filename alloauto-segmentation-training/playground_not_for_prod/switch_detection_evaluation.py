@@ -135,29 +135,7 @@ def print_switch_evaluation(metrics):
               f"  {tol_metrics['precision']:.3f}   | {tol_metrics['recall']:.3f} | {tol_metrics['f1']:.3f}")
 
 
-
-def fix_illogical_predictions(predictions):
-    """Remove illogical transitions without any extra dependencies."""
-    fixed = []
-    for i, pred in enumerate(predictions):
-        if i == 0:
-            fixed.append(pred)
-        else:
-            prev = fixed[-1]
-            # Can't switch to auto if previous was auto/switch_to_auto
-            if pred == 2 and prev in [0, 2]:
-                fixed.append(0)  # Stay in auto
-            # Can't switch to allo if previous was allo/switch_to_allo
-            elif pred == 3 and prev in [1, 3]:
-                fixed.append(1)  # Stay in allo
-            # Can't have back-to-back switches
-            elif pred in [2, 3] and prev in [2, 3]:
-                fixed.append(0 if pred == 2 else 1)
-            else:
-                fixed.append(pred)
-    return fixed
-
-def evaluate_model_on_test_switch_detection(model, tokenizer, test_csv='test_sequences_combined.csv', tolerance=5, use_postprocess=True):
+def evaluate_model_on_test_switch_detection(model, tokenizer, test_csv='test_sequences_combined.csv', tolerance=5):
     """
     Evaluate model focusing on switch detection rather than token classification.
 
@@ -219,9 +197,6 @@ def evaluate_model_on_test_switch_detection(model, tokenizer, test_csv='test_seq
             previous_word_idx = word_idx
 
         aligned_predictions = aligned_predictions[:len(tokens)]
-
-        if use_postprocess:
-            aligned_predictions = fix_illogical_predictions(aligned_predictions)
 
         # Convert to binary and find switches for this sequence
         seq_true_binary = convert_4class_to_binary(true_labels)

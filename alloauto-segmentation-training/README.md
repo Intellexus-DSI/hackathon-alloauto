@@ -16,8 +16,18 @@ this script will puchlish the model to HuggingFace (currrently by name: levshech
 Can Be changed, need huggingface accesstoken - use: export HF_TOKEN=<your token> 
 
 
-to eva;uate bith Mikes binay allo/auto setnetce level model vs the ALTO BeRT fine tuned model:
+to evaluate with Mikes binay allo/auto setnetce level model vs the ALTO BeRT fine tuned model:
 run also from hackathon-alloauto:
 
 
  python alloauto-segmentation-training/evaluate_alloauo_ft_CS_model_vs_Mik_model_fbeta.py
+
+
+for inference (for presentation UI integration)
+
+python alloauto-segmentation-training/inference_fine_tuned_CS_v2.py
+
+
+for data preprocess (data that is .txt or .docx file with <auto> and <allo> in it -> to segments with 4 classes labels):
+the preprocess is inside the fine tune script
+
