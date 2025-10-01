@@ -81,7 +81,7 @@ def main():
         logger.error(f"❌ Error loading data: {e}")
         return
     
-    samples = df["original_text"].tolist()
+    samples = df["tokens"].tolist()
 
     # Apply debug sampling if specified
     debug_samples = config.get('debug_samples', 0)
@@ -99,8 +99,8 @@ def main():
     chain = prompt | llm
     
     _append_msg("=" * 50)
-
     # Process samples
+    predictions = []
     results = []
     for i, sample in tqdm(enumerate(samples), total=len(samples), desc="Processing samples"):
         input_text = sample
@@ -124,9 +124,12 @@ def main():
             _append_msg(f"🔍 Usage metadata:\n{response.usage_metadata}")
 
             predictions = result["prediction"] if "prediction" in result else []
-        
+            first_segment = result["first_segment"] if "first_segment" in result else ""
+            total_tokens = len(input_text.split())
             results.append({
                 'predictions': predictions,
+                'first_segment': first_segment,
+                'total_tokens': total_tokens,
                 'result': result,
                 'sample_id': i+1,
                 'approach': 'few-shot' if use_few_shot else 'simple',
@@ -144,6 +147,8 @@ def main():
             logger.error(traceback.format_exc())
             results.append({
                 'predictions': predictions,
+                'first_segment': first_segment,
+                'total_tokens': total_tokens,
                 'sample_id': i+1,
                 'input_text': input_text,
                 'result': None,
