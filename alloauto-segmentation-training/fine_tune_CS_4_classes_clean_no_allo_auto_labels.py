@@ -33,7 +33,7 @@ from torch.utils.data import Dataset
 from pathlib import Path
 
 # Environment setup
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 ssl._create_default_https_context = ssl._create_unverified_context
 
 print(f"Number of GPUs available: {torch.cuda.device_count()}")
@@ -779,34 +779,6 @@ def extract_segments_with_token_limit(sentences, min_tokens=300, max_tokens=400)
     return segments
 
 
-def verify_segment_has_switch(segment_text):
-    """
-    Verify that a segment contains at least one actual switch point
-    Returns True if segment has at least one transition
-    """
-    # Must have both tags
-    if '<auto>' not in segment_text or '<allo>' not in segment_text:
-        return False
-
-    # Check for actual switches by looking at tag sequences
-    parts = re.split(r'(<auto>|<allo>)', segment_text)
-
-    last_tag = None
-    switches_found = 0
-
-    for part in parts:
-        if part == '<auto>':
-            if last_tag == '<allo>':
-                switches_found += 1
-            last_tag = '<auto>'
-        elif part == '<allo>':
-            if last_tag == '<auto>':
-                switches_found += 1
-            last_tag = '<allo>'
-
-    return switches_found > 0
-
-
 def extend_to_find_switch(current_segment, all_sentences, current_idx, max_tokens):
     """
     Try to extend segment to include at least one switch
@@ -961,6 +933,21 @@ def process_file_to_segments_old(file_path, file_type):
     return processed_segments
 
 
+def has_code_switching_tags(file_path, file_type):
+    """Check if file contains AUTO/ALLO tags before processing"""
+    try:
+        if file_type == 'docx':
+            doc = docx.Document(str(file_path))
+            text_content = ' '.join([para.text for para in doc.paragraphs])
+        else:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                text_content = f.read()
+
+        # Check for any variation of tags
+        text_lower = text_content.lower()
+        return ('<auto>' in text_lower or '<allo>' in text_lower)
+    except:
+        return False
 def process_all_files(data_dir):
     """
     Process all .txt and .docx files in the data directory
@@ -971,8 +958,13 @@ def process_all_files(data_dir):
     txt_files = list(data_path.glob("*.txt"))
     docx_files = list(data_path.glob("*.docx"))
 
-    all_files = [(f, 'txt') for f in txt_files] + [(f, 'docx') for f in docx_files]
+    # all_files = [(f, 'txt') for f in txt_files] + [(f, 'docx') for f in docx_files]
+    #
 
+    all_files = [(f, 'txt') for f in txt_files] + [(f, 'docx') for f in docx_files]
+    # Filter files with tags
+    all_files = [(f, t) for f, t in all_files if has_code_switching_tags(f, t)]
+    print(f"Files with code-switching tags: {len(all_files)}")
     print(f"\nFound {len(txt_files)} .txt files and {len(docx_files)} .docx files")
     print(f"Total files to process: {len(all_files)}")
 
@@ -1366,25 +1358,54 @@ class ProximityAwareLoss4Class(nn.Module):
                         proximity_adjusted_loss[b, pred_pos] *= self.false_positive_penalty
                 else:
                     proximity_adjusted_loss[b, pred_pos] *= self.false_positive_penalty * 2
-
-            # Penalize missed true switches
+            # Penalize missed true switches with distance-aware scaling
             for true_pos in true_switches_to_auto:
                 if len(pred_switches_to_auto) == 0:
-                    proximity_adjusted_loss[b, true_pos] *= 3.0
+                    # No predictions at all - heavy penalty
+                    proximity_adjusted_loss[b, true_pos] *= 5.0
                 else:
                     distances = torch.abs(pred_switches_to_auto - true_pos)
                     min_distance = torch.min(distances).item()
-                    if min_distance > self.proximity_tolerance:
-                        proximity_adjusted_loss[b, true_pos] *= 2.0
 
+                    if min_distance > self.proximity_tolerance:
+                        # Scale penalty based on how far the nearest prediction is
+                        # Further away = higher penalty
+                        distance_penalty = 2.0 + (min_distance - self.proximity_tolerance) * 0.3
+                        distance_penalty = min(distance_penalty, 8.0)  # Cap at 8x
+                        proximity_adjusted_loss[b, true_pos] *= distance_penalty
+                    # If within tolerance, the positive proximity logic already handled it
+
+            # Same for allo switches
             for true_pos in true_switches_to_allo:
                 if len(pred_switches_to_allo) == 0:
-                    proximity_adjusted_loss[b, true_pos] *= 3.0
+                    proximity_adjusted_loss[b, true_pos] *= 5.0
                 else:
                     distances = torch.abs(pred_switches_to_allo - true_pos)
                     min_distance = torch.min(distances).item()
+
                     if min_distance > self.proximity_tolerance:
-                        proximity_adjusted_loss[b, true_pos] *= 2.0
+                        distance_penalty = 2.0 + (min_distance - self.proximity_tolerance) * 0.3
+                        distance_penalty = min(distance_penalty, 8.0)
+                        proximity_adjusted_loss[b, true_pos] *= distance_penalty
+
+            # Penalize missed true switches
+            # for true_pos in true_switches_to_auto:
+            #     if len(pred_switches_to_auto) == 0:
+            #         proximity_adjusted_loss[b, true_pos] *= 3.0
+            #     else:
+            #         distances = torch.abs(pred_switches_to_auto - true_pos)
+            #         min_distance = torch.min(distances).item()
+            #         if min_distance > self.proximity_tolerance:
+            #             proximity_adjusted_loss[b, true_pos] *= 2.0
+
+            # for true_pos in true_switches_to_allo:
+            #     if len(pred_switches_to_allo) == 0:
+            #         proximity_adjusted_loss[b, true_pos] *= 3.0
+            #     else:
+            #         distances = torch.abs(pred_switches_to_allo - true_pos)
+            #         min_distance = torch.min(distances).item()
+            #         if min_distance > self.proximity_tolerance:
+            #             proximity_adjusted_loss[b, true_pos] *= 2.0
 
         # Apply valid mask and compute mean
         total_loss = proximity_adjusted_loss * valid_mask
@@ -1797,7 +1818,7 @@ def train_tibetan_code_switching():
 
     # Step 1: Process all files
     print("\nSTEP 1: Processing files...")
-    data_dir = 'dataset/all data'
+    data_dir = 'dataset/annotated-data-raw'
     # data_dir = 'classify_allo_auto/data'
 
     if not os.path.exists(data_dir):
@@ -1854,7 +1875,7 @@ def train_tibetan_code_switching():
     # model_name = 'bert-base-multilingual-cased'
     model_name = 'OMRIDRORI/mbert-tibetan-continual-wylie-final'
     # output_dir = './tibetan_code_switching_constrained_model_bert-base-multilingual-cased'
-    output_dir = './tibetan_code_switching_constrained_model_wylie-final_all_data_no_labels_no_prtial'
+    output_dir = './tibetan_code_switching_constrained_model_wylie-final_all_data_no_labels_no_prtial_v2_2_10'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1942,8 +1963,8 @@ def train_tibetan_code_switching():
         gradient_accumulation_steps=4,
         label_smoothing_factor=0.05,  # Reduced smoothing
         gradient_checkpointing=True,
-        push_to_hub=True,  # Enable pushing to HF
-        hub_model_id="levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial",  # Your HF repo
+        # push_to_hub=True,  # Enable pushing to HF
+        # hub_model_id="levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial",  # Your HF repo
     )
 
     # Custom trainer with logical constraints
