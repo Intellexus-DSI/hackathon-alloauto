@@ -1,0 +1,18 @@
+# Model configuration
+temperature: 0.3
+# few_shot: false
+few_shot: false
+seed: 42
+model_name: "gemini-2.5-flash"
+# model_name: "gemini-2.5-pro"
+# max_tokens: 1000
+
+# Data configuration  
+data_dir: "../dataset/annotated-data"
+data_file_name: "test_segments.csv"
+use_post_process: true
+
+
+# Debug configuration
+debug_samples: 1  # Set to 0 or negative to use all samples, positive number to limit samples
+
