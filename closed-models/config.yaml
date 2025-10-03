@@ -10,9 +10,9 @@ model_name: "gemini-2.5-flash"
 # Data configuration  
 data_dir: "../dataset/annotated-data"
 data_file_name: "test_segments.csv"
-use_post_process: true
+#use_post_process: false
 
 
 # Debug configuration
-debug_samples: 1  # Set to 0 or negative to use all samples, positive number to limit samples
+debug_samples: -1  # Set to 0 or negative to use all samples, positive number to limit samples
 

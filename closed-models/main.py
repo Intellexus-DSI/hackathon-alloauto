@@ -110,7 +110,7 @@ def main():
             continue
         
         _append_msg(f"🔄 Processing sample {i+1}")
-        _append_msg(f"📄 Input length: {len(input_text)} characters")
+        _append_msg(f"📄 Input length: {len(input_text)} characters, {len(input_text.split())} tokens")
         
         try:
             response = chain.invoke({"text": input_text})
@@ -126,20 +126,24 @@ def main():
             predictions = result["prediction"] if "prediction" in result else []
             first_segment = result["first_segment"] if "first_segment" in result else ""
             total_tokens = len(input_text.split())
+            labeled_array = utils.convert_to_labeled_array(predictions, first_segment, total_tokens)
             results.append({
                 'predictions': predictions,
                 'first_segment': first_segment,
                 'total_tokens': total_tokens,
-                'result': result,
+                'LLM_output': result,
                 'sample_id': i+1,
-                'approach': 'few-shot' if use_few_shot else 'simple',
+                'approach': 'few-shot' if use_few_shot else 'zero-shot',
+                'labeled_array': labeled_array,
             })
 
             _append_msg(f"✅ Sample {i+1} processed successfully")
-            _append_msg(f"📊 Result: {result}")
+            _append_msg(f"📊 LLM output: {result}")
             if debug_samples > 0:
                 tqdm.write(f"✅ Sample {i+1} processed successfully")
-                tqdm.write(f"📊 Result: {result}")
+                tqdm.write(f"📊 LLM output: {result}")
+
+            _append_msg(f"📊 Labeled array: {labeled_array}")
 
         except Exception as e:
             _append_msg(f"❌ Error processing sample {i+1}: {e}")
@@ -151,9 +155,10 @@ def main():
                 'total_tokens': total_tokens,
                 'sample_id': i+1,
                 'input_text': input_text,
-                'result': None,
+                'LLM_output': None,
                 'error': str(e),
                 'approach': 'few-shot' if use_few_shot else 'zero-shot',
+                'labeled_array': labeled_array,
             })
         
         _append_msg("-" * 30)
@@ -177,13 +182,6 @@ def main():
     logger.info("📈 Writing report")
     utils.write_report(messages, "./closed models/report.log")
     logger.info("✅ Report written to: report.log")
-    # Summary
-    # print("=" * 50)
-    # print("📈 SUMMARY")
-    # print("=" * 50)
-
-    # ADD THIS NEW SECTION:
-    # Calculate and display character-level metrics
 
 if __name__ == "__main__":
     main()
