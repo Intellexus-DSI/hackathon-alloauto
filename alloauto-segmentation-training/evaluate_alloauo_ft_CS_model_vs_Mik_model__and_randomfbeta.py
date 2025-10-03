@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, AutoModelForTokenClassification
 from sklearn.metrics import fbeta_score, precision_score, recall_score, f1_score
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 print(f"Number of GPUs available: {torch.cuda.device_count()}")
 for i in range(torch.cuda.device_count()):
@@ -562,7 +562,39 @@ def verify_no_tags_in_datasets():
 
     return all_clean
 
+from fine_tune_CS_4_classes_clean_no_allo_auto_labels_CRF import apply_transition_constraints
+def process_alto_with_constraints(tokens, tokenizer, model, device):
+    """ALTO model with post-processing constraints (no CRF)"""
+    # Get raw predictions from ALTO
+    tokenizer_output = tokenizer(
+        tokens,
+        is_split_into_words=True,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512
+    )
 
+    inputs = {k: v.to(device) for k, v in tokenizer_output.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predictions = torch.argmax(outputs.logits, dim=2)
+
+    # Align predictions
+    word_ids = tokenizer_output.word_ids()
+    aligned_preds = []
+    previous_word_idx = None
+
+    for j, word_idx in enumerate(word_ids):
+        if word_idx is not None and word_idx != previous_word_idx:
+            aligned_preds.append(predictions[0][j].item())
+        previous_word_idx = word_idx
+
+    # Apply logical constraints (this function already exists in your code)
+    constrained_preds = apply_transition_constraints(aligned_preds)
+
+    return constrained_preds
 def unified_evaluation():
     """Main evaluation function on complete test set - now includes random baseline"""
     print("=" * 80)
@@ -610,6 +642,13 @@ def unified_evaluation():
     xlmr_model = AutoModelForTokenClassification.from_pretrained('./alloauto-segmentation-training/benchmark_models/xlmroberta_baseline_model/final_model')
     xlmr_model.eval()
 
+    print("Loading CRF Model...")
+    from fine_tune_CS_4_classes_clean_no_allo_auto_labels_CRF import BERTWithCRFWrapper
+
+    crf_tokenizer = AutoTokenizer.from_pretrained('./alloauto-segmentation-training/fine_tuned_ALTO_models/crf_enhanced_model')
+    crf_model = BERTWithCRFWrapper.from_pretrained('./alloauto-segmentation-training/fine_tuned_ALTO_models/crf_enhanced_model')
+    crf_model.eval()
+
     # Load Fine-tuned Model
     print("Loading Fine-tuned Model...")
     model_id = "./tibetan_code_switching_constrained_model_wylie-final_all_data_no_labels_no_prtial_v2_2_10/final_model"
@@ -621,6 +660,8 @@ def unified_evaluation():
     mbert_model = mbert_model.to(device)
     xlmr_model = xlmr_model.to(device)
     ft_model = ft_model.to(device)
+    crf_model = crf_model.to(device)  # NEW
+
     print(f"Using device: {device}\n")
 
     # Process all test segments
@@ -630,6 +671,7 @@ def unified_evaluation():
     finetuned_all_pred = []
     mbert_all_pred = []
     random_all_pred = []  # NEW
+    crf_all_pred = []
     xlmr_all_pred = []
 
     for idx, row in test_df.iterrows():
@@ -644,11 +686,13 @@ def unified_evaluation():
         binary_pred = process_binary_model_sentence_level(tokens, binary_tokenizer, binary_session)
         mbert_pred = process_finetuned_model(tokens, mbert_tokenizer, mbert_model, device)
         xlmr_pred = process_finetuned_model(tokens, xlmr_tokenizer, xlmr_model, device)  # NEW
+        crf_pred = process_alto_with_constraints(tokens, ft_tokenizer, ft_model, device)
+
         alto_pred = process_finetuned_model(tokens, ft_tokenizer, ft_model, device)
 
         # Align lengths
         min_len = min(len(true_labels), len(random_pred), len(binary_pred),
-                      len(mbert_pred), len(xlmr_pred), len(alto_pred))
+                      len(mbert_pred), len(xlmr_pred), len(alto_pred), len(crf_pred))
 
         all_true_labels.extend(true_labels[:min_len])
         random_all_pred.extend(random_pred[:min_len])
@@ -656,6 +700,7 @@ def unified_evaluation():
         mbert_all_pred.extend(mbert_pred[:min_len])
         xlmr_all_pred.extend(xlmr_pred[:min_len])  # NEW
         finetuned_all_pred.extend(alto_pred[:min_len])
+        crf_all_pred.extend(crf_pred[:min_len])  # NEW
 
         # Calculate metrics
     random_metrics = evaluate_switch_detection_with_proximity(all_true_labels, random_all_pred, TOLERANCE)
@@ -663,13 +708,12 @@ def unified_evaluation():
     mbert_metrics = evaluate_switch_detection_with_proximity(all_true_labels, mbert_all_pred, TOLERANCE)
     xlmr_metrics = evaluate_switch_detection_with_proximity(all_true_labels, xlmr_all_pred, TOLERANCE)  # NEW
     alto_metrics = evaluate_switch_detection_with_proximity(all_true_labels, finetuned_all_pred, TOLERANCE)
-
-    # Print comparison
-    print(f"\n{'=' * 160}")
-    print("5-MODEL COMPARISON")
-    print(f"{'=' * 160}")
-    print(f"{'Metric':<30} {'Random':<16} {'Binary':<16} {'mBERT':<16} {'XLM-R':<16} {'ALTO':<16}")
-    print("-" * 160)
+    crf_metrics = evaluate_switch_detection_with_proximity(all_true_labels, crf_all_pred, TOLERANCE)  # NEW
+    print(f"\n{'=' * 180}")
+    print("6-MODEL COMPARISON")
+    print(f"{'=' * 180}")
+    print(f"{'Metric':<30} {'Random':<16} {'Binary':<16} {'mBERT':<16} {'XLM-R':<16} {'ALTO':<16} {'CRF':<16}")
+    print("-" * 180)
 
     metrics_to_show = [
         ('F-beta(2)', 'proximity_fbeta2'),
@@ -683,10 +727,12 @@ def unified_evaluation():
         m = mbert_metrics[key]
         x = xlmr_metrics[key]
         a = alto_metrics[key]
+        c = crf_metrics[key]  # NEW
 
-        print(f"{display:<30} {r:<16.3f} {b:<16.3f} {m:<16.3f} {x:<16.3f} {a:<16.3f}")
+        print(f"{display:<30} {r:<16.3f} {b:<16.3f} {m:<16.3f} {x:<16.3f} {a:<16.3f} {c:<16.3f}")
 
-    return random_metrics, binary_metrics, mbert_metrics, xlmr_metrics, alto_metrics
+    return random_metrics, binary_metrics, mbert_metrics, xlmr_metrics, alto_metrics, crf_metrics  # 6 models
+
 def unified_evaluation_old():
     """Main evaluation function on complete test set"""
     print("=" * 80)
@@ -1736,9 +1782,346 @@ def show_detailed_segment_comparisons_five_models(test_df, binary_tokenizer, bin
         print(f"  ALTO:     {sum(1 for l in alto_pred if l == 2)} →AUTO, {sum(1 for l in alto_pred if l == 3)} →ALLO")
 
 
+def create_detailed_segment_analysis_csv(output_file='segment_analysis_detailed.csv'):
+    """
+    Create detailed CSV showing per-segment performance of all models
+    """
+    print("\n" + "=" * 80)
+    print("CREATING DETAILED SEGMENT ANALYSIS CSV")
+    print("=" * 80)
+
+    TEST_FILE = './dataset/annotated-data/test_segments.csv'
+    test_df = pd.read_csv(TEST_FILE)
+
+    # Calculate average switches for random model
+    total_switches = 0
+    for idx in range(len(test_df)):
+        labels = [int(l) for l in test_df.iloc[idx]['labels'].split(',')]
+        total_switches += sum(1 for l in labels if l in [2, 3])
+    avg_switches = total_switches / len(test_df)
+
+    # Load all models
+    print("Loading all models...")
+    binary_tokenizer = AutoTokenizer.from_pretrained('./alloauto-presentation/web/model')
+    binary_session = ort.InferenceSession('./alloauto-presentation/web/model/onnx/model.onnx')
+
+    mbert_tokenizer = AutoTokenizer.from_pretrained(
+        './alloauto-segmentation-training/benchmark_models/mbert_baseline_model/final_model')
+    mbert_model = AutoModelForTokenClassification.from_pretrained(
+        './alloauto-segmentation-training/benchmark_models/mbert_baseline_model/final_model')
+    mbert_model.eval()
+
+    xlmr_tokenizer = AutoTokenizer.from_pretrained(
+        './alloauto-segmentation-training/benchmark_models/xlmroberta_baseline_model/final_model')
+    xlmr_model = AutoModelForTokenClassification.from_pretrained(
+        './alloauto-segmentation-training/benchmark_models/xlmroberta_baseline_model/final_model')
+    xlmr_model.eval()
+
+    alto_model_id = "./tibetan_code_switching_constrained_model_wylie-final_all_data_no_labels_no_prtial_v2_2_10/final_model"
+    alto_tokenizer = AutoTokenizer.from_pretrained(alto_model_id)
+    alto_model = AutoModelForTokenClassification.from_pretrained(alto_model_id)
+    alto_model.eval()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    mbert_model = mbert_model.to(device)
+    xlmr_model = xlmr_model.to(device)
+    alto_model = alto_model.to(device)
+
+    print(f"Processing {len(test_df)} segments...")
+
+    results = []
+
+    for idx, row in test_df.iterrows():
+        if idx % 10 == 0:
+            print(f"  Processing segment {idx}/{len(test_df)}...")
+
+        segment_id = row['segment_id']
+        source_file = row['source_file']
+        tokens = row['tokens'].split()
+        true_labels = [int(l) for l in row['labels'].split(',')]
+
+        # Get predictions from all models
+        random_pred = process_random_model(tokens, avg_switches_per_segment=avg_switches, seed=42 + idx)
+        binary_pred = process_binary_model_sentence_level(tokens, binary_tokenizer, binary_session)
+        mbert_pred = process_finetuned_model(tokens, mbert_tokenizer, mbert_model, device)
+        xlmr_pred = process_finetuned_model(tokens, xlmr_tokenizer, xlmr_model, device)
+        alto_pred = process_finetuned_model(tokens, alto_tokenizer, alto_model, device)
+
+        # Align lengths
+        min_len = min(len(true_labels), len(random_pred), len(binary_pred),
+                      len(mbert_pred), len(xlmr_pred), len(alto_pred))
+
+        true_labels = true_labels[:min_len]
+        tokens = tokens[:min_len]
+        random_pred = random_pred[:min_len]
+        binary_pred = binary_pred[:min_len]
+        mbert_pred = mbert_pred[:min_len]
+        xlmr_pred = xlmr_pred[:min_len]
+        alto_pred = alto_pred[:min_len]
+
+        # Analyze each model's performance
+        models = {
+            'Random': random_pred,
+            'Binary': binary_pred,
+            'mBERT': mbert_pred,
+            'XLM-R': xlmr_pred,
+            'ALTO': alto_pred
+        }
+
+        # Base segment info
+        segment_result = {
+            'segment_id': segment_id,
+            'source_file': source_file,
+            'num_tokens': len(tokens),
+            'tokens': ' '.join(tokens),
+            'true_labels': ','.join(map(str, true_labels)),
+        }
+
+        # True switch statistics
+        true_switches_to_auto = [i for i, l in enumerate(true_labels) if l == 2]
+        true_switches_to_allo = [i for i, l in enumerate(true_labels) if l == 3]
+
+        segment_result['true_total_switches'] = len(true_switches_to_auto) + len(true_switches_to_allo)
+        segment_result['true_switches_to_auto'] = len(true_switches_to_auto)
+        segment_result['true_switches_to_allo'] = len(true_switches_to_allo)
+        segment_result['true_switch_positions'] = ','.join(map(str, true_switches_to_auto + true_switches_to_allo))
+
+        # Analyze each model
+        for model_name, pred_labels in models.items():
+            # Get predictions for this model
+            pred_switches_to_auto = [i for i, l in enumerate(pred_labels) if l == 2]
+            pred_switches_to_allo = [i for i, l in enumerate(pred_labels) if l == 3]
+
+            # Store predictions
+            segment_result[f'{model_name}_pred_labels'] = ','.join(map(str, pred_labels))
+            segment_result[f'{model_name}_pred_total_switches'] = len(pred_switches_to_auto) + len(
+                pred_switches_to_allo)
+            segment_result[f'{model_name}_pred_to_auto'] = len(pred_switches_to_auto)
+            segment_result[f'{model_name}_pred_to_allo'] = len(pred_switches_to_allo)
+
+            # Match true switches with predicted switches (with tolerance)
+            tolerance = 5
+
+            # Match AUTO switches
+            matched_auto_exact = []
+            matched_auto_proximity = []
+
+            for true_pos in true_switches_to_auto:
+                best_match = None
+                best_distance = float('inf')
+
+                for pred_pos in pred_switches_to_auto:
+                    distance = abs(true_pos - pred_pos)
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_match = pred_pos
+
+                if best_match is not None and best_distance <= tolerance:
+                    if best_distance == 0:
+                        matched_auto_exact.append((true_pos, best_match, best_distance))
+                    else:
+                        matched_auto_proximity.append((true_pos, best_match, best_distance))
+
+            # Match ALLO switches
+            matched_allo_exact = []
+            matched_allo_proximity = []
+
+            for true_pos in true_switches_to_allo:
+                best_match = None
+                best_distance = float('inf')
+
+                for pred_pos in pred_switches_to_allo:
+                    distance = abs(true_pos - pred_pos)
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_match = pred_pos
+
+                if best_match is not None and best_distance <= tolerance:
+                    if best_distance == 0:
+                        matched_allo_exact.append((true_pos, best_match, best_distance))
+                    else:
+                        matched_allo_proximity.append((true_pos, best_match, best_distance))
+
+            # Store match statistics
+            segment_result[f'{model_name}_matched_auto_exact'] = len(matched_auto_exact)
+            segment_result[f'{model_name}_matched_auto_proximity'] = len(matched_auto_proximity)
+            segment_result[f'{model_name}_matched_auto_total'] = len(matched_auto_exact) + len(matched_auto_proximity)
+
+            segment_result[f'{model_name}_matched_allo_exact'] = len(matched_allo_exact)
+            segment_result[f'{model_name}_matched_allo_proximity'] = len(matched_allo_proximity)
+            segment_result[f'{model_name}_matched_allo_total'] = len(matched_allo_exact) + len(matched_allo_proximity)
+
+            # Total matches
+            total_exact = len(matched_auto_exact) + len(matched_allo_exact)
+            total_proximity = len(matched_auto_proximity) + len(matched_allo_proximity)
+
+            segment_result[f'{model_name}_exact_matches'] = total_exact
+            segment_result[f'{model_name}_proximity_matches'] = total_proximity
+            segment_result[f'{model_name}_total_matches'] = total_exact + total_proximity
+
+            # Missed switches
+            segment_result[f'{model_name}_missed_switches'] = segment_result['true_total_switches'] - (
+                        total_exact + total_proximity)
+
+            # False positives
+            total_pred = len(pred_switches_to_auto) + len(pred_switches_to_allo)
+            segment_result[f'{model_name}_false_positives'] = total_pred - (total_exact + total_proximity)
+
+            # Store detailed match info
+            auto_match_details = '; '.join(
+                [f"true:{t}→pred:{p}(dist:{d})" for t, p, d in matched_auto_exact + matched_auto_proximity])
+            allo_match_details = '; '.join(
+                [f"true:{t}→pred:{p}(dist:{d})" for t, p, d in matched_allo_exact + matched_allo_proximity])
+
+            segment_result[f'{model_name}_auto_match_details'] = auto_match_details if auto_match_details else 'none'
+            segment_result[f'{model_name}_allo_match_details'] = allo_match_details if allo_match_details else 'none'
+
+            # Calculate metrics for this segment
+            true_total = segment_result['true_total_switches']
+            pred_total = total_pred
+            matched_total = total_exact + total_proximity
+
+            precision = matched_total / pred_total if pred_total > 0 else 0
+            recall = matched_total / true_total if true_total > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+            segment_result[f'{model_name}_precision'] = round(precision, 3)
+            segment_result[f'{model_name}_recall'] = round(recall, 3)
+            segment_result[f'{model_name}_f1'] = round(f1, 3)
+
+        results.append(segment_result)
+
+    # Create DataFrame
+    df_results = pd.DataFrame(results)
+
+    # Save to CSV
+    df_results.to_csv(output_file, index=False)
+
+    print(f"\n✅ Detailed analysis saved to: {output_file}")
+    print(f"   Total segments: {len(df_results)}")
+    print(f"   Total columns: {len(df_results.columns)}")
+
+    # Print summary statistics
+    print("\n" + "=" * 80)
+    print("SUMMARY STATISTICS")
+    print("=" * 80)
+
+    for model_name in ['Random', 'Binary', 'mBERT', 'XLM-R', 'ALTO']:
+        print(f"\n{model_name}:")
+        print(f"  Avg Exact Matches: {df_results[f'{model_name}_exact_matches'].mean():.2f}")
+        print(f"  Avg Proximity Matches: {df_results[f'{model_name}_proximity_matches'].mean():.2f}")
+        print(f"  Avg Total Matches: {df_results[f'{model_name}_total_matches'].mean():.2f}")
+        print(f"  Avg Precision: {df_results[f'{model_name}_precision'].mean():.3f}")
+        print(f"  Avg Recall: {df_results[f'{model_name}_recall'].mean():.3f}")
+        print(f"  Avg F1: {df_results[f'{model_name}_f1'].mean():.3f}")
+
+    return df_results
+
+
+def process_crf_model(tokens, tokenizer, model, device):
+    """Process tokens through CRF-enhanced model (uses Viterbi decoding)"""
+    tokenizer_output = tokenizer(
+        tokens,
+        is_split_into_words=True,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512
+    )
+
+    # Filter inputs - only pass what the model expects
+    inputs = {
+        'input_ids': tokenizer_output['input_ids'].to(device),
+        'attention_mask': tokenizer_output['attention_mask'].to(device)
+    }
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        # CRF returns predictions from Viterbi
+        viterbi_predictions = outputs['predictions'][0]
+
+    # Align to original tokens
+    word_ids = tokenizer_output.word_ids()
+    aligned_preds = []
+    previous_word_idx = None
+    pred_idx = 0
+
+    for word_idx in word_ids:
+        if word_idx is not None and word_idx != previous_word_idx:
+            if pred_idx < len(viterbi_predictions):
+                aligned_preds.append(viterbi_predictions[pred_idx])
+                pred_idx += 1
+        previous_word_idx = word_idx
+
+    return aligned_preds
+
+def print_fbeta_comparison_six_models(random_metrics, binary_metrics, mbert_metrics, xlmr_metrics, alto_metrics,
+                                      crf_metrics):
+    """Print comprehensive comparison of all 6 models"""
+
+    print("\n" + "=" * 160)
+    print("SIX-WAY MODEL COMPARISON (5-token tolerance)")
+    print("=" * 160)
+
+    print(f"\n{'Metric':<35} {'Random':<18} {'Binary':<18} {'mBERT':<18} {'XLM-R':<18} {'ALTO':<18} {'CRF':<18}")
+    print("-" * 160)
+
+    metrics_to_show = [
+        ('F-beta(2)', 'proximity_fbeta2'),
+        ('Precision', 'proximity_precision'),
+        ('Recall', 'proximity_recall'),
+        ('F1', 'proximity_f1'),
+        ('Macro F-beta(2)', 'macro_fbeta2'),
+        ('Switch→Auto F-beta(2)', 'to_auto_fbeta2'),
+        ('Switch→Allo F-beta(2)', 'to_allo_fbeta2'),
+    ]
+
+    for display, key in metrics_to_show:
+        r = random_metrics[key]
+        b = binary_metrics[key]
+        m = mbert_metrics[key]
+        x = xlmr_metrics[key]
+        a = alto_metrics[key]
+        c = crf_metrics[key]
+
+        # Mark the best (excluding random)
+        best_val = max(b, m, x, a, c)
+        b_mark = " ★" if b == best_val else ""
+        m_mark = " ★" if m == best_val else ""
+        x_mark = " ★" if x == best_val else ""
+        a_mark = " ★" if a == best_val else ""
+        c_mark = " ★" if c == best_val else ""
+
+        print(f"{display:<35} {r:<18.3f} {b:<15.3f}{b_mark:<3} {m:<15.3f}{m_mark:<3} "
+              f"{x:<15.3f}{x_mark:<3} {a:<15.3f}{a_mark:<3} {c:<15.3f}{c_mark:<3}")
+
+    print("\n" + "=" * 160)
+    print("KEY FINDINGS")
+    print("=" * 160)
+
+    key = 'proximity_fbeta2'
+
+    print(f"\nCRF vs ALTO Comparison:")
+    if crf_metrics[key] > alto_metrics[key]:
+        improvement = (crf_metrics[key] - alto_metrics[key]) / alto_metrics[key] * 100
+        print(f"  ✓ CRF improves over ALTO by {improvement:.1f}%")
+        print(f"  CRF: {crf_metrics[key]:.3f} vs ALTO: {alto_metrics[key]:.3f}")
+    else:
+        decline = (alto_metrics[key] - crf_metrics[key]) / alto_metrics[key] * 100
+        print(f"  ⚠ CRF performs {decline:.1f}% worse than ALTO")
+        print(f"  ALTO: {alto_metrics[key]:.3f} vs CRF: {crf_metrics[key]:.3f}")
+
+    print(f"\nBest overall model: ", end="")
+    best_model = max([('Binary', b), ('mBERT', m), ('XLM-R', x), ('ALTO', a), ('CRF', c)],
+                     key=lambda x: binary_metrics[key] if x[0] == 'Binary' else
+                     mbert_metrics[key] if x[0] == 'mBERT' else
+                     xlmr_metrics[key] if x[0] == 'XLM-R' else
+                     alto_metrics[key] if x[0] == 'ALTO' else
+                     crf_metrics[key])
+    print(f"{best_model[0]} (F-beta(2): {best_model[1]:.3f})")
 if __name__ == "__main__":
     # Returns 5 models now
-    random_metrics, binary_metrics, mbert_metrics, xlmr_metrics, alto_metrics = unified_evaluation()
+    random_metrics, binary_metrics, mbert_metrics, xlmr_metrics, alto_metrics, crf_metrics = unified_evaluation()
 
     if random_metrics is not None:
         print("\n" + "=" * 160)
@@ -1746,9 +2129,9 @@ if __name__ == "__main__":
         print("=" * 160)
 
         # Compare all FIVE models
-        print_fbeta_comparison_five_models(random_metrics, binary_metrics,
-                                           mbert_metrics, xlmr_metrics, alto_metrics)
 
+        print_fbeta_comparison_six_models(random_metrics, binary_metrics, mbert_metrics,
+                                          xlmr_metrics, alto_metrics, crf_metrics)
         # Show detailed segment comparisons
         print("\n\nLoading models for detailed segment comparisons...")
         TEST_FILE = './dataset/annotated-data/test_segments.csv'
@@ -1791,3 +2174,28 @@ if __name__ == "__main__":
             alto_tokenizer, alto_model,
             num_examples=3, avg_switches=avg_switches
         )
+
+        print("\n\n" + "=" * 80)
+        print("CREATING DETAILED SEGMENT ANALYSIS")
+        print("=" * 80)
+
+        df_detailed = create_detailed_segment_analysis_csv('segment_analysis_detailed.csv')
+
+        # Optional: Show some examples
+        print("\n" + "=" * 80)
+        print("EXAMPLE: First 3 segments")
+        print("=" * 80)
+
+        for idx in range(min(3, len(df_detailed))):
+            row = df_detailed.iloc[idx]
+            print(f"\nSegment {idx + 1}: {row['segment_id']}")
+            print(f"  File: {row['source_file']}")
+            print(
+                f"  True switches: {row['true_total_switches']} (→AUTO: {row['true_switches_to_auto']}, →ALLO: {row['true_switches_to_allo']})")
+            print(f"  Model performance:")
+            for model in ['Random', 'Binary', 'mBERT', 'XLM-R', 'ALTO']:
+                print(
+                    f"    {model:10s}: Exact={row[f'{model}_exact_matches']}, Proximity={row[f'{model}_proximity_matches']}, F1={row[f'{model}_f1']:.3f}")
+
+        # import ipdb
+        # ipdb.set_trace()
