@@ -14,103 +14,7 @@ from sklearn.metrics import fbeta_score, precision_score, recall_score, f1_score
 import os
 import utils
 
-
-def process_binary_model_sentence_level(tokens, tokenizer, session):
-    """
-    Process tokens through binary model which works at sentence level
-    The model classifies chunks/sentences, not individual tokens
-    """
-    # Reconstruct text from tokens
-    text = " ".join(tokens)
-
-    # Split into chunks/sentences (following the JS implementation)
-    # The JS splits by / or //
-    chunks = re.split(r'\s*/+\s*', text)
-    chunks = [c.strip() for c in chunks if c.strip()]
-
-    if not chunks:
-        # If no chunks, treat entire text as one chunk
-        chunks = [text]
-
-    # Classify each chunk
-    chunk_predictions = []
-
-    for chunk in chunks:
-        if not chunk:
-            continue
-
-        # Tokenize the chunk
-        inputs = tokenizer(
-            chunk,
-            return_tensors="np",
-            padding=False,
-            truncation=True,
-            max_length=512
-        )
-
-        # Get ONNX inputs
-        onnx_inputs = {inp.name for inp in session.get_inputs()}
-        filtered_inputs = {}
-        for key, value in inputs.items():
-            if key in onnx_inputs:
-                filtered_inputs[key] = value
-
-        # Run inference
-        outputs = session.run(None, filtered_inputs)
-        logits = outputs[0]
-
-        # Apply softmax to get probabilities
-        if len(logits.shape) == 2:
-            logits = logits[0]  # Remove batch dimension if present
-
-        # Softmax
-        exp_logits = np.exp(logits - np.max(logits))
-        probs = exp_logits / np.sum(exp_logits)
-
-        # Class 0 is allo, class 1 is auto (based on the JS code)
-        predicted_class = np.argmax(probs)
-        chunk_predictions.append(predicted_class)
-
-    # Now map chunk-level predictions back to token level
-    token_labels = []
-    token_idx = 0
-
-    for chunk_idx, chunk in enumerate(chunks):
-        chunk_tokens = chunk.split()
-        chunk_class = chunk_predictions[chunk_idx] if chunk_idx < len(chunk_predictions) else 0
-
-        # Determine if this is a switch
-        is_switch = False
-        if chunk_idx > 0 and chunk_idx < len(chunk_predictions):
-            prev_class = chunk_predictions[chunk_idx - 1]
-            curr_class = chunk_predictions[chunk_idx]
-            if prev_class != curr_class:
-                is_switch = True
-
-        # Assign labels to tokens in this chunk
-        for i, token in enumerate(chunk_tokens):
-            if token_idx < len(tokens):
-                if i == 0 and is_switch:
-                    # First token of a chunk that switches
-                    if chunk_class == 0:  # Switching to allo
-                        label = 3  # Switch to Allo
-                    else:  # Switching to auto
-                        label = 2  # Switch to Auto
-                else:
-                    # Continuation in current mode
-                    if chunk_class == 0:  # Allo
-                        label = 1  # Non-switch Allo
-                    else:  # Auto
-                        label = 0  # Non-switch Auto
-
-                token_labels.append(label)
-                token_idx += 1
-
-    # Handle any remaining tokens (shouldn't happen but just in case)
-    while len(token_labels) < len(tokens):
-        token_labels.append(0)  # Default to Auto
-
-    return token_labels[:len(tokens)]
+CLOSED_MODELS_RESULTS_FILE = './closed-models/results/results_zero_shot_83_samples.jsonl'
 
 def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance=5):
     """
@@ -280,100 +184,6 @@ def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance
         'matched_to_allo': len(matched_true_to_allo),
     }
 
-def convert_binary_to_4class(binary_preds):
-    """Convert binary predictions to 4-class labels"""
-    labels_4class = []
-    prev_binary = None
-
-    for curr_binary in binary_preds:
-        if prev_binary is None:
-            labels_4class.append(0 if curr_binary == 0 else 1)
-        else:
-            if prev_binary == 0 and curr_binary == 1:
-                labels_4class.append(3)  # Switch to Allo
-            elif prev_binary == 1 and curr_binary == 0:
-                labels_4class.append(2)  # Switch to Auto
-            else:
-                labels_4class.append(0 if curr_binary == 0 else 1)
-        prev_binary = curr_binary
-
-    return labels_4class
-
-def process_binary_model(tokens, tokenizer, session):
-    """Process tokens through binary model and return 4-class predictions"""
-    inputs = tokenizer(
-        " ".join(tokens),
-        return_tensors="np",
-        padding=False,
-        truncation=True,
-        max_length=512
-    )
-
-    # Get the input names expected by the ONNX model
-    onnx_inputs = {inp.name for inp in session.get_inputs()}
-
-    # Filter inputs to only include what ONNX expects
-    filtered_inputs = {}
-    for key, value in inputs.items():
-        if key in onnx_inputs:
-            filtered_inputs[key] = value
-
-    # Run inference with filtered inputs
-    outputs = session.run(None, filtered_inputs)
-    predictions = outputs[0]
-
-    # Handle both single and batch predictions
-    if len(predictions.shape) == 3:  # Batch dimension exists
-        predicted_classes = np.argmax(predictions, axis=-1)[0]
-    elif len(predictions.shape) == 2:  # No batch dimension
-        predicted_classes = np.argmax(predictions, axis=-1)
-    else:
-        raise ValueError(f"Unexpected prediction shape: {predictions.shape}")
-
-    # Ensure predicted_classes is always an array
-    if predicted_classes.ndim == 0:  # It's a scalar
-        predicted_classes = np.array([predicted_classes])
-
-    word_ids = inputs.word_ids()
-    aligned_preds = []
-    previous_word_idx = None
-
-    for i, word_idx in enumerate(word_ids):
-        if word_idx is not None and word_idx != previous_word_idx:
-            if i < len(predicted_classes):
-                aligned_preds.append(predicted_classes[i])
-            else:
-                # If we run out of predictions, use the last one
-                aligned_preds.append(predicted_classes[-1] if len(predicted_classes) > 0 else 0)
-        previous_word_idx = word_idx
-
-    return convert_binary_to_4class(aligned_preds)
-
-def process_binary_model_old(tokens, tokenizer, session):
-    """Process tokens through binary model and return 4-class predictions"""
-    inputs = tokenizer(
-        " ".join(tokens),
-        return_tensors="np",
-        padding=False,
-        truncation=True,
-        max_length=512
-    )
-
-    outputs = session.run(None, dict(inputs))
-    predictions = outputs[0]
-    predicted_classes = np.argmax(predictions, axis=-1)[0]
-
-    word_ids = inputs.word_ids()
-    aligned_preds = []
-    previous_word_idx = None
-
-    for i, word_idx in enumerate(word_ids):
-        if word_idx is not None and word_idx != previous_word_idx:
-            aligned_preds.append(predicted_classes[i])
-        previous_word_idx = word_idx
-
-    return convert_binary_to_4class(aligned_preds)
-
 def process_finetuned_model(tokens, tokenizer, model, device):
     """Process tokens through fine-tuned model"""
     tokenizer_output = tokenizer(
@@ -518,7 +328,6 @@ def unified_evaluation():
     # TEST_FILE = './test_segments.csv'
     TEST_FILE = './dataset/annotated-data/test_segments.csv'
     TOLERANCE = 5
-    CLOSED_MODELS_RESULTS_FILE = './closed-models/results/results_zero_shot_83_samples.jsonl'
     
     print(f"Loading test data from: {TEST_FILE}")
     test_df = pd.read_csv(TEST_FILE)
@@ -699,94 +508,6 @@ def unified_evaluation():
 
     return closed_models_metrics, finetuned_metrics
 
-def show_detailed_comparisons(test_df, binary_tokenizer, binary_session, ft_tokenizer, ft_model, num_examples=5):
-    """Show detailed side-by-side comparisons of model predictions"""
-
-    device = next(ft_model.parameters()).device
-    label_names = {
-        0: 'Auto',
-        1: 'Allo',
-        2: '→AUTO',
-        3: '→ALLO'
-    }
-
-    print("\n" + "=" * 100)
-    print("DETAILED SEGMENT COMPARISONS")
-    print("=" * 100)
-
-    # Sample random examples
-    sample_indices = np.random.choice(len(test_df), min(num_examples, len(test_df)), replace=False)
-
-    for ex_num, idx in enumerate(sample_indices):
-        row = test_df.iloc[idx]
-        tokens = row['tokens'].split()
-        true_labels = [int(l) for l in row['labels'].split(',')]
-
-        # Get predictions from both models
-        binary_pred = process_binary_model(tokens, binary_tokenizer, binary_session)
-        ft_pred = process_finetuned_model(tokens, ft_tokenizer, ft_model, device)
-
-        # Align to same length
-        min_len = min(len(tokens), len(true_labels), len(binary_pred), len(ft_pred))
-        tokens = tokens[:min_len]
-        true_labels = true_labels[:min_len]
-        binary_pred = binary_pred[:min_len]
-        ft_pred = ft_pred[:min_len]
-
-        print(f"\n{'─' * 100}")
-        print(f"EXAMPLE {ex_num + 1} - File: {row['source_file'][:50]}...")
-        print(f"Segment length: {len(tokens)} tokens")
-
-        # Count switches
-        true_switches = sum(1 for l in true_labels if l in [2, 3])
-        binary_switches = sum(1 for l in binary_pred if l in [2, 3])
-        ft_switches = sum(1 for l in ft_pred if l in [2, 3])
-
-        print(f"\nSwitch counts:")
-        print(f"  Ground truth: {true_switches} switches")
-        print(f"  Binary model: {binary_switches} switches")
-        print(f"  Fine-tuned:   {ft_switches} switches")
-
-        # Show first 30 tokens in detail
-        print(f"\nDetailed token-by-token comparison (first 30 tokens):")
-        print(f"{'Pos':<5} {'Token':<20} {'True':<8} {'Binary':<8} {'Fine-tuned':<12} {'Match'}")
-        print("─" * 70)
-
-        for i in range(min(30, len(tokens))):
-            token = tokens[i][:19]
-            true_lab = label_names[true_labels[i]]
-            binary_lab = label_names[binary_pred[i]]
-            ft_lab = label_names[ft_pred[i]]
-
-            # Highlight switches
-            if true_labels[i] in [2, 3]:
-                token = f"*{token}*"
-
-            # Check if predictions match truth
-            binary_match = "✓" if binary_pred[i] == true_labels[i] else "✗"
-            ft_match = "✓" if ft_pred[i] == true_labels[i] else "✗"
-
-            print(f"[{i:3d}] {token:<20} {true_lab:<8} {binary_lab:<8}{binary_match} {ft_lab:<12}{ft_match}")
-
-        # Show switch regions specifically
-        switch_positions = [i for i, l in enumerate(true_labels) if l in [2, 3]]
-        if switch_positions and len(switch_positions) <= 10:
-            print(f"\nDetailed view at switch points:")
-            for switch_pos in switch_positions[:5]:  # Show first 5 switches
-                print(f"\n  Switch at position {switch_pos}:")
-                start = max(0, switch_pos - 2)
-                end = min(len(tokens), switch_pos + 3)
-
-                for pos in range(start, end):
-                    marker = ">>>" if pos == switch_pos else "   "
-                    token = tokens[pos][:15]
-                    true_lab = label_names[true_labels[pos]]
-                    binary_lab = label_names[binary_pred[pos]]
-                    ft_lab = label_names[ft_pred[pos]]
-
-                    print(f"    {marker} [{pos:3d}] {token:<15} True:{true_lab:<8} Bin:{binary_lab:<8} FT:{ft_lab}")
-
-
 def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
     """Print comprehensive F-beta(2) comparison with per-class metrics (5-token tolerance)"""
 
@@ -936,8 +657,7 @@ def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
           f"{finetuned_metrics.get('true_to_allo', 0):<25} "
           f"{'(same test set)':<20}")
 
-
-def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session, ft_tokenizer, ft_model,
+def show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model,
                                       num_examples=10):
     """Show detailed side-by-side comparisons with actual label names"""
 
@@ -957,6 +677,7 @@ def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
 
     # Sample random segments
     sample_indices = np.random.choice(len(test_df), min(num_examples, len(test_df)), replace=False)
+    closed_models_predictions = list(utils.load_results_json(CLOSED_MODELS_RESULTS_FILE))
 
     for ex_num, idx in enumerate(sample_indices, 1):
         row = test_df.iloc[idx]
@@ -964,14 +685,15 @@ def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
         true_labels = [int(l) for l in row['labels'].split(',')]
 
         # Get predictions
-        binary_pred = process_binary_model_sentence_level(tokens, binary_tokenizer, binary_session)
         ft_pred = process_finetuned_model(tokens, ft_tokenizer, ft_model, device)
-
+    
+        closed_models_pred = closed_models_predictions[idx]['labeled_array']
         # Align lengths
-        min_len = min(len(tokens), len(true_labels), len(binary_pred), len(ft_pred))
+        min_len = min(len(tokens), len(closed_models_pred), len(true_labels), len(ft_pred))
+
         tokens = tokens[:min_len]
         true_labels = true_labels[:min_len]
-        binary_pred = binary_pred[:min_len]
+        closed_models_pred = closed_models_pred[:min_len]
         ft_pred = ft_pred[:min_len]
 
         print(f"\n{'─' * 120}")
@@ -980,13 +702,13 @@ def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
         print(f"{'─' * 120}")
 
         # Calculate metrics for this segment
-        seg_binary_metrics = evaluate_switch_detection_with_proximity(true_labels, binary_pred, tolerance=5)
+        seg_closed_models_metrics = evaluate_switch_detection_with_proximity(true_labels, closed_models_pred, tolerance=5)
         seg_ft_metrics = evaluate_switch_detection_with_proximity(true_labels, ft_pred, tolerance=5)
 
         print(f"\nSegment Metrics:")
-        print(f"  Binary Model - F-beta(2): {seg_binary_metrics['proximity_fbeta2']:.3f} | "
-              f"Precision: {seg_binary_metrics['proximity_precision']:.3f} | "
-              f"Recall: {seg_binary_metrics['proximity_recall']:.3f}")
+        print(f"  Closed Models - F-beta(2): {seg_closed_models_metrics['proximity_fbeta2']:.3f} | "
+              f"Precision: {seg_closed_models_metrics['proximity_precision']:.3f} | "
+              f"Recall: {seg_closed_models_metrics['proximity_recall']:.3f}")
         print(f"  Fine-tuned   - F-beta(2): {seg_ft_metrics['proximity_fbeta2']:.3f} | "
               f"Precision: {seg_ft_metrics['proximity_precision']:.3f} | "
               f"Recall: {seg_ft_metrics['proximity_recall']:.3f}")
@@ -994,26 +716,25 @@ def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
         # Show detailed comparison
         print(f"\nToken-by-token comparison (showing first 40 tokens):")
         print(f"{'─' * 120}")
-        print(f"{'Pos':<5} {'Token':<15} {'True Label':<10} {'Binary Pred':<12} {'Fine-tuned':<12} {'Match'}")
+        print(f"{'Pos':<5} {'Token':<15} {'True Label':<10} {'Closed Models':<12} {'Fine-tuned':<12} {'Match'}")
         print(f"{'─' * 120}")
 
         for i in range(min(40, len(tokens))):
             token = tokens[i][:14]
             true_label = label_names[true_labels[i]]
-            binary_label = label_names[binary_pred[i]]
+            closed_models_label = label_names[closed_models_pred[i]]
             ft_label = label_names[ft_pred[i]]
 
             # Check matches
-            binary_match = "✓" if binary_pred[i] == true_labels[i] else "✗"
+            closed_models_match = "✓" if closed_models_pred[i] == true_labels[i] else "✗"
             ft_match = "✓" if ft_pred[i] == true_labels[i] else "✓"
 
-            # Highlight switch points
             if true_labels[i] in [2, 3]:
                 print(
-                    f"[{i:3d}] {token:<15} **{true_label:<10} {binary_label:<10}{binary_match}  {ft_label:<10}{ft_match}")
+                    f"[{i:3d}] {token:<15} **{true_label:<10} {closed_models_label:<10}{closed_models_match}  {ft_label:<10}{ft_match}")
             else:
                 print(
-                    f"[{i:3d}] {token:<15} {true_label:<10} {binary_label:<10}{binary_match}  {ft_label:<10}{ft_match}")
+                    f"[{i:3d}] {token:<15} {true_label:<10} {closed_models_label:<10}{closed_models_match}  {ft_label:<10}{ft_match}")
 
         # Show switch regions in detail
         true_switches = [(i, true_labels[i]) for i in range(len(true_labels)) if true_labels[i] in [2, 3]]
@@ -1029,36 +750,35 @@ def show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
                 start = max(0, switch_idx - 3)
                 end = min(len(tokens), switch_idx + 4)
 
-                print(f"{'Pos':<8} {'Token':<15} {'True':<10} {'Binary':<10} {'Fine-tuned':<10}")
+                print(f"{'Pos':<8} {'Token':<15} {'True':<10} {'Closed Models':<10} {'Fine-tuned':<10}")
                 print("-" * 60)
 
                 for pos in range(start, end):
                     marker = ">>>" if pos == switch_idx else "   "
                     token = tokens[pos][:14]
                     true_label = label_names[true_labels[pos]]
-                    binary_label = label_names[binary_pred[pos]]
+                    closed_models_label = label_names[closed_models_pred[pos]]
                     ft_label = label_names[ft_pred[pos]]
 
                     if pos == switch_idx:
                         # Highlight the switch point
-                        print(f"{marker} [{pos:3d}] {token:<15} {true_label:<10} {binary_label:<10} {ft_label:<10}")
+                        print(f"{marker} [{pos:3d}] {token:<15} {true_label:<10} {closed_models_label:<10} {ft_label:<10}")
                     else:
-                        print(f"    [{pos:3d}] {token:<15} {true_label:<10} {binary_label:<10} {ft_label:<10}")
+                        print(f"    [{pos:3d}] {token:<15} {true_label:<10} {closed_models_label:<10} {ft_label:<10}")
 
         # Summary for this segment
         print(f"\n{'─' * 120}")
         print(f"Summary for Segment {ex_num}:")
         true_auto_switches = sum(1 for l in true_labels if l == 2)
         true_allo_switches = sum(1 for l in true_labels if l == 3)
-        binary_auto_switches = sum(1 for l in binary_pred if l == 2)
-        binary_allo_switches = sum(1 for l in binary_pred if l == 3)
+        closed_models_auto_switches = sum(1 for l in closed_models_pred if l == 2)
+        closed_models_allo_switches = sum(1 for l in closed_models_pred if l == 3)
         ft_auto_switches = sum(1 for l in ft_pred if l == 2)
         ft_allo_switches = sum(1 for l in ft_pred if l == 3)
 
         print(f"  True Labels:    {true_auto_switches} →AUTO, {true_allo_switches} →ALLO")
-        print(f"  Binary Model:   {binary_auto_switches} →AUTO, {binary_allo_switches} →ALLO")
+        print(f"  Closed Models:   {closed_models_auto_switches} →AUTO, {closed_models_allo_switches} →ALLO")
         print(f"  Fine-tuned:     {ft_auto_switches} →AUTO, {ft_allo_switches} →ALLO")
-
 
 if __name__ == "__main__":
     closed_models_metrics, finetuned_metrics = unified_evaluation()
@@ -1066,24 +786,20 @@ if __name__ == "__main__":
     print_fbeta_comparison(closed_models_metrics, finetuned_metrics)
 
     # Load models for detailed comparison
-    # print("\n\nLoading models for detailed segment comparisons...")
+    print("\n\nLoading models for detailed segment comparisons...")
 
-    # TEST_FILE = './dataset/annotated-data/test_segments.csv'
-    # test_df = pd.read_csv(TEST_FILE)
+    TEST_FILE = './dataset/annotated-data/test_segments.csv'
+    test_df = pd.read_csv(TEST_FILE)
 
 
-    # binary_tokenizer = AutoTokenizer.from_pretrained('./alloauto-presentation/web/model')
-    # binary_session = ort.InferenceSession('./alloauto-presentation/web/model/onnx/model.onnx')
+    model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial"
+    # model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
+    ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
+    ft_model.eval()
 
-    # model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial"
-    # # model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
-    # ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # ft_model = AutoModelForTokenClassification.from_pretrained(model_id)
-    # ft_model.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ft_model = ft_model.to(device)
 
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # ft_model = ft_model.to(device)
-
-    # # Show detailed comparisons
-    # show_detailed_segment_comparisons(test_df, binary_tokenizer, binary_session,
-    #                                   ft_tokenizer, ft_model, num_examples=1)
+    # Show detailed comparisons
+    show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model, num_examples=1)

@@ -196,8 +196,9 @@ def load_results_json(file_path: str) -> Generator[dict, None, None]:
                 'predictions': json_line['predictions'],
                 'total_tokens': json_line['total_tokens'],
                 'labeled_array': json_line['labeled_array'],
+                'sample_id': json_line['sample_id'],
             }
-
+            
 def fill_class_segments(results: List[dict]) -> List[List[int]]:
     """Fill class segments in results"""
     full_predictions = []
@@ -262,7 +263,7 @@ def convert_to_labeled_array(prediction: List[int], first_segment: str, total_to
 
     return labels
 
-def get_closed_models_predictions(file_path: str):
+def get_closed_models_predictions(file_path: str) -> List[int]:
     """Get metrics for closed models predictions"""
     results = load_results_json(file_path)
     predictions = []
