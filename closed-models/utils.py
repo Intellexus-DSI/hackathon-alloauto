@@ -195,6 +195,7 @@ def load_results_json(file_path: str) -> Generator[dict, None, None]:
                 'first_segment': json_line['first_segment'],
                 'predictions': json_line['predictions'],
                 'total_tokens': json_line['total_tokens'],
+                'labeled_array': json_line['labeled_array'],
             }
 
 def fill_class_segments(results: List[dict]) -> List[List[int]]:
@@ -233,3 +234,38 @@ def fill_class_segments(results: List[dict]) -> List[List[int]]:
         full_predictions.append(curr_labels)
     return full_predictions
     
+def convert_to_labeled_array(prediction: List[int], first_segment: str, total_tokens: int) -> List[int]:
+    """Convert single prediction to array"""
+    if first_segment == 'auto':
+        curr_class, curr_switch_class = 0, 3
+    elif first_segment == 'allo':
+        curr_class, curr_switch_class = 1, 2
+    else:
+        raise ValueError(f"Invalid first segment: {first_segment}")
+
+    if prediction == []:
+        return [curr_class] * total_tokens
+
+    prev_break_idx = 0
+    labels = [None] * total_tokens
+    for break_idx in prediction:
+        for i in range(prev_break_idx, break_idx):
+            labels[i] = curr_class
+        labels[break_idx] = curr_switch_class
+
+        curr_class = 0 if curr_class == 1 else 1
+        curr_switch_class = 2 if curr_switch_class == 3 else 3
+        prev_break_idx = break_idx + 1
+
+    for i in range(prev_break_idx, total_tokens):
+        labels[i] = curr_class
+
+    return labels
+
+def get_closed_models_predictions(file_path: str):
+    """Get metrics for closed models predictions"""
+    results = load_results_json(file_path)
+    predictions = []
+    for result in results:
+        predictions.extend(result['labeled_array'])
+    return predictions
