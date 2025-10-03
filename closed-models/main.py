@@ -144,7 +144,7 @@ def main():
                 tqdm.write(f"📊 LLM output: {result}")
 
             _append_msg(f"📊 Labeled array: {labeled_array}")
-            
+
         except Exception as e:
             _append_msg(f"❌ Error processing sample {i+1}: {e}")
             logger.error(f"❌ Error processing sample {i+1}: {e}")
@@ -182,13 +182,6 @@ def main():
     logger.info("📈 Writing report")
     utils.write_report(messages, "./closed models/report.log")
     logger.info("✅ Report written to: report.log")
-    # Summary
-    # print("=" * 50)
-    # print("📈 SUMMARY")
-    # print("=" * 50)
-
-    # ADD THIS NEW SECTION:
-    # Calculate and display character-level metrics
 
 if __name__ == "__main__":
     main()
