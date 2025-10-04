@@ -9,6 +9,7 @@ from pathlib import Path
 import json
 from tqdm import tqdm
 import logging
+import time
 
 # Suppress Google Cloud warnings  
 os.environ["GRPC_VERBOSITY"] = "ERROR"
@@ -82,6 +83,10 @@ def main():
         return
     
     samples = df["tokens"].tolist()
+    
+    use_few_shot = config.get('few_shot', True)
+    if use_few_shot:
+        samples = samples[3:]
 
     # Apply debug sampling if specified
     debug_samples = config.get('debug_samples', 0)
@@ -91,7 +96,6 @@ def main():
         logger.info(f"🐛 Debug mode: processing only {len(samples)} samples")
     
     # Get the appropriate prompt
-    use_few_shot = config.get('few_shot', True)
     prompt = utils.get_prompt(use_few_shot=use_few_shot)
     _append_msg(f'prompt:\nprompt={prompt}')
 
@@ -102,8 +106,11 @@ def main():
     # Process samples
     predictions = []
     results = []
+    labeled_array = []
+    first_segment = ""
     for i, sample in tqdm(enumerate(samples), total=len(samples), desc="Processing samples"):
         input_text = sample
+        total_tokens = len(input_text.split())
         if not input_text:
             _append_msg(f"⚠️  Skipping sample {i+1}: No text found")
             logger.warning(f"⚠️  Skipping sample {i+1}: No text found")
@@ -111,9 +118,12 @@ def main():
         
         _append_msg(f"🔄 Processing sample {i+1}")
         _append_msg(f"📄 Input length: {len(input_text)} characters, {len(input_text.split())} tokens")
-        
+        if debug_samples > 0:
+            tqdm.write(prompt.invoke({"text": input_text , "total_tokens": total_tokens - 1}).to_string())
+        if use_few_shot:
+            time.sleep(5)
         try:
-            response = chain.invoke({"text": input_text})
+            response = chain.invoke({"text": input_text, "total_tokens": total_tokens - 1})
             response_content = response.content if hasattr(response, 'content') else str(response)
             cleaned_response = response_content.strip('`').replace('json\n', '')
             try:
@@ -121,11 +131,13 @@ def main():
             except json.JSONDecodeError:
                 raise ValueError(f"Invalid JSON response: {cleaned_response}")
 
+            if debug_samples > 0:
+                tqdm.write(f"📊 LLM output: {result}")
+
             _append_msg(f"🔍 Usage metadata:\n{response.usage_metadata}")
 
             predictions = result["prediction"] if "prediction" in result else []
             first_segment = result["first_segment"] if "first_segment" in result else ""
-            total_tokens = len(input_text.split())
             labeled_array = utils.convert_to_labeled_array(predictions, first_segment, total_tokens)
             results.append({
                 'predictions': predictions,
@@ -141,13 +153,13 @@ def main():
             _append_msg(f"📊 LLM output: {result}")
             if debug_samples > 0:
                 tqdm.write(f"✅ Sample {i+1} processed successfully")
-                tqdm.write(f"📊 LLM output: {result}")
 
             _append_msg(f"📊 Labeled array: {labeled_array}")
 
         except Exception as e:
             _append_msg(f"❌ Error processing sample {i+1}: {e}")
             logger.error(f"❌ Error processing sample {i+1}: {e}")
+            logger.error(f"❌ predictions: {predictions}")
             logger.error(traceback.format_exc())
             results.append({
                 'predictions': predictions,
@@ -165,10 +177,14 @@ def main():
     
     # Save results
     try:
+        model_name = config.get('model_name', 'gemini-2.5-flash')
         approach_name = "few_shot" if use_few_shot else "zero_shot"
         results_dir = os.path.join(os.path.dirname(__file__), "results")
         os.makedirs(results_dir, exist_ok=True)
-        output_filename = f"results_{approach_name}_{len(results)}_samples.jsonl"
+        if debug_samples > 0:
+            output_filename = f"results_{approach_name}_{debug_samples}_samples_{model_name}.jsonl"
+        else:   
+            output_filename = f"results_{approach_name}_{model_name}.jsonl"
         output_file = os.path.join(results_dir, output_filename)
         utils.save_results(results, output_file)
         _append_msg(f"💾 Results saved to: {output_file}")
@@ -180,7 +196,7 @@ def main():
     
     logger.info("=" * 50)
     logger.info("📈 Writing report")
-    utils.write_report(messages, "./closed models/report.log")
+    utils.write_report(messages, "./closed-models/report.log")
     logger.info("✅ Report written to: report.log")
 
 if __name__ == "__main__":
