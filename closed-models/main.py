@@ -87,7 +87,7 @@ def main():
     use_few_shot = config.get('few_shot', True)
     if use_few_shot:
         samples = samples[3:]
-
+    cot = config.get('cot', False)
     # Apply debug sampling if specified
     debug_samples = config.get('debug_samples', 0)
     if debug_samples > 0:
@@ -96,7 +96,7 @@ def main():
         logger.info(f"🐛 Debug mode: processing only {len(samples)} samples")
     
     # Get the appropriate prompt
-    prompt = utils.get_prompt(use_few_shot=use_few_shot)
+    prompt = utils.get_prompt(use_few_shot=use_few_shot, cot=cot)
     _append_msg(f'prompt:\nprompt={prompt}')
 
     # Create chain
@@ -108,6 +108,7 @@ def main():
     results = []
     labeled_array = []
     first_segment = ""
+    reasoning = ""
     for i, sample in tqdm(enumerate(samples), total=len(samples), desc="Processing samples"):
         input_text = sample
         total_tokens = len(input_text.split())
@@ -138,10 +139,12 @@ def main():
 
             predictions = result["prediction"] if "prediction" in result else []
             first_segment = result["first_segment"] if "first_segment" in result else ""
+            reasoning = result["reasoning"] if "reasoning" in result else ""
             labeled_array = utils.convert_to_labeled_array(predictions, first_segment, total_tokens)
             results.append({
                 'predictions': predictions,
                 'first_segment': first_segment,
+                'reasoning': reasoning if cot else False,
                 'total_tokens': total_tokens,
                 'LLM_output': result,
                 'sample_id': i+1,
@@ -164,6 +167,7 @@ def main():
             results.append({
                 'predictions': predictions,
                 'first_segment': first_segment,
+                'reasoning': reasoning if cot else False,
                 'total_tokens': total_tokens,
                 'sample_id': i+1,
                 'input_text': input_text,
@@ -179,12 +183,13 @@ def main():
     try:
         model_name = config.get('model_name', 'gemini-2.5-flash')
         approach_name = "few_shot" if use_few_shot else "zero_shot"
+        using_cot = "cot" if cot else ""
         results_dir = os.path.join(os.path.dirname(__file__), "results")
         os.makedirs(results_dir, exist_ok=True)
         if debug_samples > 0:
-            output_filename = f"results_{approach_name}_{debug_samples}_samples_{model_name}.jsonl"
+            output_filename = f"results_{approach_name}{'_' if using_cot else ''}{using_cot}_{debug_samples}_samples_{model_name}.jsonl"
         else:   
-            output_filename = f"results_{approach_name}_{model_name}.jsonl"
+            output_filename = f"results_{approach_name}{'_' if using_cot else ''}{using_cot}_{model_name}.jsonl"
         output_file = os.path.join(results_dir, output_filename)
         utils.save_results(results, output_file)
         _append_msg(f"💾 Results saved to: {output_file}")

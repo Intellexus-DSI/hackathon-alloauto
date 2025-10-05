@@ -2,6 +2,7 @@
 temperature: 0.3
 # few_shot: false
 few_shot: false
+cot: true
 seed: 42
 model_name: "gemini-2.5-flash"
 # model_name: "gemini-2.5-pro"
@@ -12,7 +13,10 @@ data_dir: "../dataset/annotated-data"
 data_file_name: "test_segments.csv"
 #use_post_process: false
 
+# Results configuration
+
+#results_file: "./closed-models/results/results_zero_shot_gemini-2.5-flash.jsonl"
 
 # Debug configuration
-debug_samples: -1  # Set to 0 or negative to use all samples, positive number to limit samples
+debug_samples: -1 # Set to 0 or negative to use all samples, positive number to limit samples
 

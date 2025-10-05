@@ -70,9 +70,51 @@ PROMPT = {
     "human": "{text}\n"
 }
 
+COT_PROMPT = {
+    "system": """
+    You are a Tibetan Buddhist philology expert and computational linguist.
+    Your task is to read Tibetan text and segment it into contiguous spans of two types:
+    - AUTO (autochthonous Tibetan): passages originally composed in Tibetan.
+    - ALLO (allochthonous Tibetan): passages translated into Tibetan (typically from Sanskrit or related Indic sources).
+
+    You must output detailed reasoning for your segmentation, but only *inside the JSON object* under the key "reasoning".
+    Do NOT include explanations or commentary outside the JSON.
+
+    Return ONLY a JSON object of the form:
+    {{
+    "first_segment": "auto" | "allo",
+    "prediction": [i1, i2, ...],
+    "reasoning": "<short explanation of why and where the text switches>"
+    }}
+
+    Definitions:
+    - "first_segment" is the label of the first span in the text: "auto" or "allo".
+    - "prediction" is a list of 0-based WORD indices that mark the start of a new segment after a label change.
+    - "reasoning" is describing *why* you placed those boundaries (e.g., indicators of translationese, mantra markers, syntax shifts, etc.).
+    - If there is no switch, output: {{"first_segment": "auto"|"allo", "prediction": [], "reasoning": "No clear switch detected."}}
+
+    Word indexing rules:
+    - Normalize consecutive whitespace to single spaces for counting.
+    - The first word has index 0.
+    - Do not include index 0 in prediction.
+    - Indices must be integers, unique, strictly ascending, each within [1, {total_tokens}].
+    - Every index must be < {total_tokens}.
+
+    Strict formatting:
+    - Output only valid JSON with all three keys: "first_segment", "prediction", "reasoning".
+    - Do not include any text or commentary outside the JSON.
+    """,
+    "human": "Text: {text}\n"
+}
+
 PROMPT_ZERO_SHOT =  ChatPromptTemplate.from_messages([
     ("system", PROMPT["system"]),
     ("human", PROMPT["human"])
+])
+
+PROMPT_ZERO_SHOT_COT =  ChatPromptTemplate.from_messages([
+    ("system", COT_PROMPT["system"]),
+    ("human", COT_PROMPT["human"])
 ])
 
 # === FEW-SHOT PROMPT ===
@@ -122,7 +164,7 @@ PROMPT_FEW_SHOT = ChatPromptTemplate.from_messages([
 
 # === CONFIGURATION-BASED PROMPT SELECTION ===
 
-def get_prompt(use_few_shot=False):
+def get_prompt(use_few_shot=False, cot=False):
     """
     Get the appropriate prompt template based on configuration.
     Args:
@@ -130,9 +172,14 @@ def get_prompt(use_few_shot=False):
     Returns:
         ChatPromptTemplate: The selected prompt template
     """
+    if use_few_shot and cot:
+        raise ValueError("COT and Few-Shot prompting cannot be used together")
     if use_few_shot:
         print("Using Few-Shot Prompting approach")
         return PROMPT_FEW_SHOT
+    elif cot:
+        print("Using COT zero-shot Prompting approach")
+        return PROMPT_ZERO_SHOT_COT
     else:
         print("Using zero-shot Prompting approach")
         return PROMPT_ZERO_SHOT
