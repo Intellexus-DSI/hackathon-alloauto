@@ -57,48 +57,91 @@ PROMPT = {
     "system": """
     You are a Tibetan Buddhist philology expert and computational linguist. Your task is to read Tibetan text and segment it into contiguous spans of two types:
     AUTO (autochthonous Tibetan): passages originally composed in Tibetan. ALLO (allochthonous Tibetan): passages translated into Tibetan (typically from Sanskrit or related Indic sources).
-    Return only JSON of the form: ("first_segment": allo/auto,"prediction": [i1, i2, ...]) Each integer is a 0‑based word index that marks the start of a new segment after a label change. If there is no switch, return "prediction": [].
+    Return only JSON of the form: ("first_segment": "allo" | "auto", "prediction": [i1, i2, ...] Each integer is a 0‑based word index that marks the start of a new segment after a label change. If there is no switch, return "prediction": [].
     Split the given text into words as follows:
     - Normalize consecutive whitespace to single spaces for counting.
     - first_segment is the first segment of the text, either "allo" or "auto".
     - The first word has index 0.
     - Do not include index 0 in prediction.
-    - Indices must be integers, unique, sorted ascending, each within [1, W-1] for W total words.
+    - Indices must be integers, unique, sorted ascending, each within [1, {total_tokens}].
+    - An index must be less than {total_tokens}.
     Output only the JSON object; no explanations or extra text.
     """,
-    "user": "Text: {text}\n"
+    "human": "{text}\n"
+}
+
+COT_PROMPT = {
+    "system": """
+    You are a Tibetan Buddhist philology expert and computational linguist.
+    Your task is to read Tibetan text and segment it into contiguous spans of two types:
+    - AUTO (autochthonous Tibetan): passages originally composed in Tibetan.
+    - ALLO (allochthonous Tibetan): passages translated into Tibetan (typically from Sanskrit or related Indic sources).
+
+    You must output detailed reasoning for your segmentation, but only *inside the JSON object* under the key "reasoning".
+    Do NOT include explanations or commentary outside the JSON.
+
+    Return ONLY a JSON object of the form:
+    {{
+    "first_segment": "auto" | "allo",
+    "prediction": [i1, i2, ...],
+    "reasoning": "<short explanation of why and where the text switches>"
+    }}
+
+    Definitions:
+    - "first_segment" is the label of the first span in the text: "auto" or "allo".
+    - "prediction" is a list of 0-based WORD indices that mark the start of a new segment after a label change.
+    - "reasoning" is describing *why* you placed those boundaries (e.g., indicators of translationese, mantra markers, syntax shifts, etc.).
+    - If there is no switch, output: {{"first_segment": "auto"|"allo", "prediction": [], "reasoning": "No clear switch detected."}}
+
+    Word indexing rules:
+    - Normalize consecutive whitespace to single spaces for counting.
+    - The first word has index 0.
+    - Do not include index 0 in prediction.
+    - Indices must be integers, unique, strictly ascending, each within [1, {total_tokens}].
+    - Every index must be < {total_tokens}.
+
+    Strict formatting:
+    - Output only valid JSON with all three keys: "first_segment", "prediction", "reasoning".
+    - Do not include any text or commentary outside the JSON.
+    """,
+    "human": "Text: {text}\n"
 }
 
 PROMPT_ZERO_SHOT =  ChatPromptTemplate.from_messages([
     ("system", PROMPT["system"]),
-    ("user", PROMPT["user"])
+    ("human", PROMPT["human"])
+])
+
+PROMPT_ZERO_SHOT_COT =  ChatPromptTemplate.from_messages([
+    ("system", COT_PROMPT["system"]),
+    ("human", COT_PROMPT["human"])
 ])
 
 # === FEW-SHOT PROMPT ===
 # Define your Sanskrit examples with CORRECTED output format
 examples = [
     # Example 1: 
-    # {
-    #     "input":  "byams pa chen po rgyun chad pa nyan thos pa la dgag bya'i gtso bo ma yin pa'i phyir ro / mu gsum yongs su dag pa 'di ni ngas rim gyis bslab pa'i gzhi bsngam pa'i phyir zhes sogs kyis kyang / nyan thos pas sha za ba bkag pa ma yin te / dper na / bstan pa la rim gyis gzhug pa'i phyir du / theg pa gsum gsungs pas nyan thos pa la rang don don gnyer gyi bsam pa ma bkag pa bzhin no / des na mdo de dag gis byang sems las dang po pa sha la sred pa'i @# / dbang gis byams pa chen po rgyun chad par 'gyur ba la sha sred pas za ba bkag pa yin te / sha za ba ni byams pa chen po chad par 'gyur ro / zhes dang / ngas ni lus g. yog pa'i phyir gos sna tshogs kyang kha dog ngan par bsgyur bar bya'o zhes bstan na / sha za ba'i ro la chags pa lta ci smos / zhes sogs dang / rgyu de dag gis na byang chub sems dpa' sems dpa' chen po rnams sha mi za'o / zhes gsungs pa'i phyir ro / nga'i nyan thos rnams sha za bar mi gnang ngo zhes pas kyang mi gnod de / byang chub tu bgrod pa'i lam sangs rgyas las nyan nas / don de gzhan la thos par byed pas na / nyan thos kyi sgra byang sems la yang bshad du yong pa'i phyir ro / gal te 'dul ba nas rab byung gis rnam gsum dag pa'i sha za ba gnang yang / phyis mdo gzhan nas rab byung gis sha za ba bkag pas / 'dul ba nas rab byung gis sha za bar gnang ba ni /",
-    #     "output": '{"prediction": [130, 183]}'
-    # },
-    # # Example 2: 
-    # {
-    #     "input": "vratāya tenānucareṇa dhenor nyaṣedhi śeṣo 'py anuyāyivargaḥ |\nna cānyatas tasya śarīrarakṣā svavīryaguptā hi manoḥ prasūtiḥ \n|| 4 || \n\nvratāye\nti | rājñā devī na kevalaṃ nyaṣedhi\n \nkintu \ndhenor\n \nanucareṇa\n \ntena śeṣo ’pi anuyāyivargaḥ\n \nnyaṣedhi\n nagarasthāpitāpekṣayā śeṣatvam | svadeharakṣaṇārthaṃ kecit kuto na rakṣitā ity āha—yatas \ntasya anyataḥ śarīrarakṣā na\niva syur evaṃ tu punar vaivety avadhāraṇavācakāḥ- kuta ity āha— \nhi \nyasmāt\nkāraṇāt \nmanoḥ prasūtiḥ\n prasūyate iti prasūtiḥ santatiḥ \nsvavīryaguptā\n svavīryeṇaiva rakṣitā | na hi svaparanirvāhakasya parāpekṣeti bhāvaḥ || 4 ||",
-    #     "output": '{"prediction": [["VERSE", "vratāya tenānucareṇa dhenor nyaṣedhi śeṣo py anuyāyivargaḥ |\nna cānyatas tasya śarīrarakṣā svavīryaguptā hi manoḥ prasūtiḥ \n||"], ["INCOMPLETE_VERSE", "syur evaṃ tu punar vaivety avadhāraṇavācakāḥ"]]}'
-    # },
-    # # Example 3: 
-    # {
-    #     "input": "āsvādavadbhiḥ kavalais tṛṇānāṃ kaṇḍūyanair daśanivāraṇaiś ca |\navyāhataiḥ svairagataiḥ sa tasyāḥ samrāṭ samārādhanatatparo 'bhūt\n || 5 ||\n\nāsvāde\nti | \nsa samrāṭ\n yeneṣṭaṃ rājasūyena maṇḍalasyeśvaraś ca yaḥ śāsti yaś cājñayā rājñaḥ sa samrāṭ parikīrtitaḥ mo rāji samaḥ kvau \ntasyā\n dhenoḥ sevā\nparo ’bhūt\n | kaiḥ āsvāda eṣām astīti āsvādavantaḥ taiḥ \ntṛṇānāṃ\n grāsaiḥ grāsas tu kavala kaiḥ \nkaṇḍūyanaiḥ\n kaṣaṇaiś ca \ndaṃśanivāraṇaiś ca\n | daṃśas tu vanamakṣikā na vyāhatāni svairāṇi ca tāni gatāni ca taiḥ | mandasvacchandayoḥ svairam || 5 ||",
-    #     "output": '{"prediction": [["VERSE", "āsvādavadbhiḥ kavalais tṛṇānāṃ kaṇḍūyanair daśanivāraṇaiś ca |\navyāhataiḥ svairagataiḥ sa tasyāḥ samrāṭ samārādhanatatparo bhūt"], ["VERSE", "yeneṣṭaṃ rājasūyena maṇḍalasyeśvaraś ca yaḥ śāsti yaś cājñayā rājñaḥ sa samrāṭ parikīrtitaḥ"], ["INCOMPLETE_VERSE", "grāsas tu kavala"], ["INCOMPLETE_VERSE", "daṃśas tu vanamakṣikā"], ["INCOMPLETE_VERSE", "mandasvacchandayoḥ svairam"]]}'
-    # }
+    {
+        "input":  "grims lhod ran pa'i mtshams ni rang gis brtags pa na rig pa 'phang 'di tsam cig bstod na rgod pa skye nges par 'dug snyam pa'i tshad de las ni lhod la / 'di tsam cig la bzhag na bying pa skye sla bar 'dug snyam pa'i tshad de las kyang 'phang mtho ba'i 'jog tshul la bya'o / lnga ba de'i shes byed 'god pa ni / 'phags pa thogs med kyis kyang / de la 'jog par byed pa dang yang dag par 'jog par byed pa la ni bsgrims te 'jug pa'i yid la byed pa yod do / zhes sems dang po gnyis kyi skabs su gsungs shing / sgom rim dang po las kyang bying ba bsal la dmigs pa de nyid dam du gzung ngo / zhes bshad do / drug pa dran pa bsten tshul ma shes pa'i skyon ni /",
+        "output": '{"first_segment": "auto", "prediction": [76, 103, 120, 133]}'
+    },
+    # Example 2: 
+    {
+        "input": "byams pa chen po rgyun chad pa nyan thos pa la dgag bya'i gtso bo ma yin pa'i phyir ro / mu gsum yongs su dag pa 'di ni ngas rim gyis bslab pa'i gzhi bsngam pa'i phyir zhes sogs kyis kyang / nyan thos pas sha za ba bkag pa ma yin te / dper na / bstan pa la rim gyis gzhug pa'i phyir du / theg pa gsum gsungs pas nyan thos pa la rang don don gnyer gyi bsam pa ma bkag pa bzhin no / des na mdo de dag gis byang sems las dang po pa sha la sred pa'i @# / dbang gis byams pa chen po rgyun chad par 'gyur ba la sha sred pas za ba bkag pa yin te / sha za ba ni byams pa chen po chad par 'gyur ro / zhes dang / ngas ni lus g. yog pa'i phyir gos sna tshogs kyang kha dog ngan par bsgyur bar bya'o zhes bstan na / sha za ba'i ro la chags pa lta ci smos / zhes sogs dang /",
+        "output": '{"first_segment": "auto", "prediction": [130, 143, 146, 179]}'
+    },
+    # Example 3: 
+    {
+        "input": "yod des rnal bzhin gnyid log na / de las ma rungs gzhan ci yod / ces gsungs pa dang / spyod 'jug las kyang / thams cad bor te cha dgos par / bdag gis de ltar ma shes nas / mdza' dang mi mdza'i don gyi phyir / sdig pa rnam pa sna tshogs byas / zhes gsungs so /",
+        "output": '{"first_segment": "auto", "prediction": [26, 58]}'
+    }
 
 ]
 
 # Define how each example should be formatted
 example_prompt = ChatPromptTemplate.from_messages([
     ("human", "{input}"),
-    ("assistant", "{output}")
+    ("ai", "{output}")
 ])
 
 # Create the few-shot prompt template
@@ -106,17 +149,22 @@ few_shot_prompt = FewShotChatMessagePromptTemplate(
     example_prompt=example_prompt,
     examples=examples,
 )
-
+# few_shot_system = ChatPromptTemplate.from_messages([
+#     ('system', """The following Human–AI pairs are EXAMPLES."""),
+#     ('system', """END OF EXAMPLES \n """)
+# ])
 # Reuse the zero-shot prompt and add few-shot examples
 PROMPT_FEW_SHOT = ChatPromptTemplate.from_messages([
     *PROMPT_ZERO_SHOT.messages[:-1],  # All messages except the last user message
+    #few_shot_system.messages[0],
     few_shot_prompt,
+   #few_shot_system.messages[1],
     PROMPT_ZERO_SHOT.messages[-1]     # The original user message template
 ])
 
 # === CONFIGURATION-BASED PROMPT SELECTION ===
 
-def get_prompt(use_few_shot=False):
+def get_prompt(use_few_shot=False, cot=False):
     """
     Get the appropriate prompt template based on configuration.
     Args:
@@ -124,9 +172,14 @@ def get_prompt(use_few_shot=False):
     Returns:
         ChatPromptTemplate: The selected prompt template
     """
+    if use_few_shot and cot:
+        raise ValueError("COT and Few-Shot prompting cannot be used together")
     if use_few_shot:
         print("Using Few-Shot Prompting approach")
         return PROMPT_FEW_SHOT
+    elif cot:
+        print("Using COT zero-shot Prompting approach")
+        return PROMPT_ZERO_SHOT_COT
     else:
         print("Using zero-shot Prompting approach")
         return PROMPT_ZERO_SHOT
@@ -250,6 +303,8 @@ def convert_to_labeled_array(prediction: List[int], first_segment: str, total_to
     prev_break_idx = 0
     labels = [None] * total_tokens
     for break_idx in prediction:
+        if break_idx == total_tokens:
+            return labels
         for i in range(prev_break_idx, break_idx):
             labels[i] = curr_class
         labels[break_idx] = curr_switch_class

@@ -14,7 +14,18 @@ from sklearn.metrics import fbeta_score, precision_score, recall_score, f1_score
 import os
 import utils
 
-CLOSED_MODELS_RESULTS_FILE = './closed-models/results/results_zero_shot_83_samples.jsonl'
+# Messages for report
+messages = []
+def _append_msg(msg: str) -> None:
+    if not msg:
+        return
+    messages.append(msg)
+
+config = utils.load_config()
+USE_FEW_SHOT = config.get('few_shot', False)
+CLOSED_MODEL_NAME = config.get('model_name', 'gemini-2.5-flash') 
+CLOSED_MODEL_NAME += '_FS' if USE_FEW_SHOT else '_ZS'
+CLOSED_MODELS_RESULTS_FILE = f"./closed-models/results/results_{'few_shot' if USE_FEW_SHOT else 'zero_shot'}_{config.get('model_name', 'gemini-2.5-flash')}.jsonl"
 
 def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance=5):
     """
@@ -220,6 +231,10 @@ def verify_no_tags_in_datasets():
     print("VERIFYING NO TAGS IN DATASETS")
     print("=" * 80)
 
+    _append_msg("=" * 80)
+    _append_msg("VERIFYING NO TAGS IN DATASETS")
+    _append_msg("=" * 80)
+
     # Define tag patterns to search for
     tag_patterns = [
         r'<auto>',
@@ -243,6 +258,7 @@ def verify_no_tags_in_datasets():
 
     for dataset_name, filepath in datasets.items():
         print(f"\nChecking {dataset_name} dataset: {filepath}")
+        _append_msg(f"\nChecking {dataset_name} dataset: {filepath}")
 
         try:
             df = pd.read_csv(filepath)
@@ -280,6 +296,7 @@ def verify_no_tags_in_datasets():
                     print(f"    Segment {seg_idx}, Token {token_idx}: '{token}'")
             else:
                 print(f"  ✅ No tags found in tokens")
+                _append_msg(f"  ✅ No tags found in tokens")
 
             # Check if 'original_text' column exists and verify it too
             if 'original_text' in df.columns:
@@ -297,19 +314,23 @@ def verify_no_tags_in_datasets():
                     print(f"  Segments with tags: {texts_with_tags[:5]}...")
                 else:
                     print(f"  ✅ No tags found in original_text")
-
+                    _append_msg(f"  ✅ No tags found in original_text")
+                    
         except FileNotFoundError:
             print(f"  ❌ File not found: {filepath}")
         except Exception as e:
             print(f"  ❌ Error reading file: {e}")
 
     print("\n" + "=" * 80)
+    _append_msg("\n" + "=" * 80)
     if all_clean:
         print("✅ VERIFICATION PASSED: No tags found in any dataset!")
+        _append_msg("✅ VERIFICATION PASSED: No tags found in any dataset!")
     else:
         print("⚠️ VERIFICATION FAILED: Tags found in datasets!")
         print("Please re-run preprocessing to ensure tags are removed.")
     print("=" * 80)
+    _append_msg("=" * 80)
 
     return all_clean
 
@@ -318,6 +339,9 @@ def unified_evaluation():
     print("=" * 80)
     print("VERIFYING DATASETS ARE TAG-FREE")
     print("=" * 80)
+    _append_msg("=" * 80)
+    _append_msg("VERIFYING DATASETS ARE TAG-FREE")
+    _append_msg("=" * 80)
 
     datasets_clean = verify_no_tags_in_datasets()
     if not datasets_clean:
@@ -329,9 +353,18 @@ def unified_evaluation():
     TEST_FILE = './dataset/annotated-data/test_segments.csv'
     TOLERANCE = 5
     
+    print(f"Using {CLOSED_MODEL_NAME[:-3]} for evaluation")
+    _append_msg(f"Using {CLOSED_MODEL_NAME[:-3]} for evaluation")
     print(f"Loading test data from: {TEST_FILE}")
+    _append_msg(f"Loading test data from: {TEST_FILE}")
     test_df = pd.read_csv(TEST_FILE)
+    if USE_FEW_SHOT:
+        print("Using few-shot evaluation")
+        _append_msg("Using few-shot evaluation")
+        test_df = test_df.loc[3:].reset_index(drop=True)
+
     print(f"Test set size: {len(test_df)} segments")
+    _append_msg(f"Test set size: {len(test_df)} segments")
 
     # Calculate test set statistics
     total_tokens = 0
@@ -342,14 +375,20 @@ def unified_evaluation():
         total_switches += sum(1 for l in labels if l in [2, 3])
 
     print(f"Total tokens in test set: {total_tokens}")
+    _append_msg(f"Total tokens in test set: {total_tokens}")
     print(f"Total switches in test set: {total_switches}")
+    _append_msg(f"Total switches in test set: {total_switches}")
     print(f"Average switches per segment: {total_switches / len(test_df):.2f}\n")
-
+    _append_msg(f"Average switches per segment: {total_switches / len(test_df):.2f}\n")
     print("Loading Closed Models Predictions...")
+
+    print(f"Loading Closed Models Predictions from: {CLOSED_MODELS_RESULTS_FILE}")
+    _append_msg(f"Loading Closed Models Predictions from: {CLOSED_MODELS_RESULTS_FILE}")
     closed_models_predictions = utils.get_closed_models_predictions(CLOSED_MODELS_RESULTS_FILE)
 
     # Load Fine-tuned Model
     print("Loading Fine-tuned Model...")
+    _append_msg("Loading Fine-tuned Model...")
     model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial"
     # model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
     ft_tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -359,9 +398,11 @@ def unified_evaluation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ft_model = ft_model.to(device)
     print(f"Using device: {device}\n")
+    _append_msg(f"Using device: {device}\n")
 
     # Process all test segments
     print("Processing all test segments...")
+    _append_msg("Processing all test segments...")
     all_true_labels = []
     finetuned_all_pred = []
 
@@ -381,12 +422,16 @@ def unified_evaluation():
         finetuned_all_pred.extend(ft_pred[:min_len])
 
     print(f"\nTotal tokens evaluated: {len(all_true_labels)}")
+    _append_msg(f"Total tokens evaluated: {len(all_true_labels)}")
     print(f"Ground truth switches: {sum(1 for l in all_true_labels if l in [2, 3])}")
+    _append_msg(f"Ground truth switches: {sum(1 for l in all_true_labels if l in [2, 3])}")
     print(f"Closed models predicted switches: {sum(1 for l in closed_models_predictions if l in [2, 3])}")
+    _append_msg(f"Closed models predicted switches: {sum(1 for l in closed_models_predictions if l in [2, 3])}")
     print(f"Fine-tuned predicted switches: {sum(1 for l in finetuned_all_pred if l in [2, 3])}")
-
+    _append_msg(f"Fine-tuned predicted switches: {sum(1 for l in finetuned_all_pred if l in [2, 3])}")
     # Calculate metrics for both models
     print("\nCalculating metrics...")
+    _append_msg("Calculating metrics...")
     closed_models_metrics = evaluate_switch_detection_with_proximity(all_true_labels, closed_models_predictions, TOLERANCE)
     finetuned_metrics = evaluate_switch_detection_with_proximity(all_true_labels, finetuned_all_pred, TOLERANCE)
 
@@ -394,12 +439,20 @@ def unified_evaluation():
     print("COMPREHENSIVE EVALUATION RESULTS")
     print(f"{'=' * 100}")
 
+    _append_msg(f"{'=' * 100}")
+    _append_msg("COMPREHENSIVE EVALUATION RESULTS")
+    _append_msg(f"{'=' * 100}")
+
     print(f"\n{'─' * 100}")
     print("PROXIMITY-BASED METRICS (5-token tolerance)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Closed Models':<20} {'ALTO BeRT':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
 
+    _append_msg(f"{'─' * 100}")
+    _append_msg("PROXIMITY-BASED METRICS (5-token tolerance)")
+    _append_msg(f"{'─' * 100}")
+    _append_msg(f"{'Metric':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     proximity_metrics = [
         ('Precision (w/ tolerance)', 'proximity_precision'),
         ('Recall (w/ tolerance)', 'proximity_recall'),
@@ -411,12 +464,18 @@ def unified_evaluation():
         f_val = finetuned_metrics[key]
         diff = f_val - c_val
         print(f"{display:<30} {c_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+        _append_msg(f"{display:<30} {c_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
 
     print(f"\n{'─' * 100}")
     print("EXACT METRICS (sklearn - no tolerance)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Closed Models':<20} {'ALTO BeRT':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
+
+    _append_msg(f"{'─' * 100}")
+    _append_msg("EXACT METRICS (sklearn - no tolerance)")
+    _append_msg(f"{'─' * 100}")
+    _append_msg(f"{'Metric':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     exact_metrics = [
         ('Precision (exact)', 'exact_precision'),  # Changed from 'sklearn_precision'
         ('Recall (exact)', 'exact_recall'),  # Changed from 'sklearn_recall'
@@ -431,13 +490,18 @@ def unified_evaluation():
         f_val = finetuned_metrics[key]
         diff = f_val - c_val
         print(f"{display:<30} {c_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+        _append_msg(f"{display:<30} {c_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
 
     print(f"\n{'─' * 100}")
     print("MACRO METRICS (average of switch types)")
     print(f"{'─' * 100}")
-    print(f"{'Metric':<30} {'Closed Models':<20} {'ALTO BeRT':<20} {'Difference':<20}")
+    print(f"{'Metric':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
 
+    _append_msg(f"{'─' * 100}")
+    _append_msg("MACRO METRICS (average of switch types)")
+    _append_msg(f"{'─' * 100}")
+    _append_msg(f"{'Metric':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     macro_metrics = [
         ('Macro Precision', 'macro_precision'),
         ('Macro Recall', 'macro_recall'),
@@ -450,12 +514,19 @@ def unified_evaluation():
         f_val = finetuned_metrics[key]
         diff = f_val - c_val
         print(f"{display:<30} {c_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
+        _append_msg(f"{display:<30} {c_val:<20.3f} {f_val:<20.3f} {diff:+20.3f}")
 
     print(f"\n{'─' * 100}")
     print("PER-TYPE F-BETA(2) SCORES")
     print(f"{'─' * 100}")
-    print(f"{'Switch Type':<30} {'Closed Models':<20} {'ALTO BeRT':<20} {'Difference':<20}")
+    print(f"{'Switch Type':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20} {'Difference':<20}")
     print("-" * 100)
+
+    _append_msg(f"{'─' * 100}")
+    _append_msg("PER-TYPE F-BETA(2) SCORES")
+    _append_msg(f"{'─' * 100}")
+    _append_msg(f"{'Switch Type':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20} {'Difference':<20}")
+
 
     print(f"{'Switch→Auto F-beta(2)':<30} {closed_models_metrics['to_auto_fbeta2']:<20.3f} "
           f"{finetuned_metrics['to_auto_fbeta2']:<20.3f} "
@@ -464,11 +535,24 @@ def unified_evaluation():
           f"{finetuned_metrics['to_allo_fbeta2']:<20.3f} "
           f"{finetuned_metrics['to_allo_fbeta2'] - closed_models_metrics['to_allo_fbeta2']:+20.3f}")
 
+    _append_msg(f"{'Switch→Auto F-beta(2)':<30} {closed_models_metrics['to_auto_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_auto_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_auto_fbeta2'] - closed_models_metrics['to_auto_fbeta2']:+20.3f}")
+    _append_msg(f"{'Switch→Allo F-beta(2)':<30} {closed_models_metrics['to_allo_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_allo_fbeta2']:<20.3f} "
+          f"{finetuned_metrics['to_allo_fbeta2'] - closed_models_metrics['to_allo_fbeta2']:+20.3f}")
+
+
     print(f"\n{'─' * 100}")
     print("COUNT STATISTICS")
     print(f"{'─' * 100}")
-    print(f"{'Statistic':<30} {'Closed Models':<20} {'ALTO BeRT':<20}")
+    print(f"{'Statistic':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20}")
     print("-" * 100)
+
+    _append_msg(f"{'─' * 100}")
+    _append_msg("COUNT STATISTICS")
+    _append_msg(f"{'─' * 100}")
+    _append_msg(f"{'Statistic':<30} {f'{CLOSED_MODEL_NAME}':<20} {'ALTO BeRT':<20}")
 
     count_stats = [
         ('True Switches', 'true_switches'),
@@ -485,11 +569,16 @@ def unified_evaluation():
         c_val = closed_models_metrics[key]
         f_val = finetuned_metrics[key]
         print(f"{display:<30} {c_val:<20} {f_val:<20}")
+        _append_msg(f"{display:<30} {c_val:<20} {f_val:<20}")
 
     # Summary winner
     print(f"\n{'=' * 100}")
     print("SUMMARY")
     print(f"{'=' * 100}")
+
+    _append_msg(f"{'=' * 100}")
+    _append_msg("SUMMARY")
+    _append_msg(f"{'=' * 100}")
 
     winner_count = {'closed_models': 0, 'finetuned': 0}
 
@@ -503,8 +592,10 @@ def unified_evaluation():
 
     if winner_count['finetuned'] > winner_count['closed_models']:
         print("🏆 Fine-tuned model performs better on key metrics (F1, F-beta scores)")
+        _append_msg("🏆 Fine-tuned model performs better on key metrics (F1, F-beta scores)")
     else:
-        print("🏆 Closed models model performs better on key metrics (F1, F-beta scores)")
+        print(f"🏆 {CLOSED_MODEL_NAME} model performs better on key metrics (F1, F-beta scores)")
+        _append_msg(f"🏆 {CLOSED_MODEL_NAME} model performs better on key metrics (F1, F-beta scores)")
 
     return closed_models_metrics, finetuned_metrics
 
@@ -515,15 +606,29 @@ def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
     print("COMPREHENSIVE F-BETA(2) AND PER-CLASS COMPARISON WITH 5-TOKEN TOLERANCE")
     print("=" * 120)
 
+    _append_msg(f"{'=' * 120}")
+    _append_msg("COMPREHENSIVE F-BETA(2) AND PER-CLASS COMPARISON WITH 5-TOKEN TOLERANCE")
+    _append_msg(f"{'=' * 120}")
+
     # Overall metrics with tolerance
     print("\n" + "─" * 120)
     print("OVERALL METRICS (5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Closed Models':<25} {'ALTO BeRT':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {f'{CLOSED_MODEL_NAME}':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
+
+    _append_msg(f"{'─' * 120}")
+    _append_msg("OVERALL METRICS (5-token tolerance)")
+    _append_msg(f"{'─' * 120}")
+    _append_msg(f"{'Metric':<20} {f'{CLOSED_MODEL_NAME}':<25} {'ALTO BeRT':<25} {'Difference':<20}")
+    _append_msg(f"{'─' * 120}")
 
     # Overall F-beta(2)
     print(f"{'F-beta(2)':<20} {closed_models_metrics['proximity_fbeta2']:<25.3f} "
+          f"{finetuned_metrics['proximity_fbeta2']:<25.3f} "
+          f"{finetuned_metrics['proximity_fbeta2'] - closed_models_metrics['proximity_fbeta2']:+20.3f}")
+
+    _append_msg(f"{'F-beta(2)':<20} {closed_models_metrics['proximity_fbeta2']:<25.3f} "
           f"{finetuned_metrics['proximity_fbeta2']:<25.3f} "
           f"{finetuned_metrics['proximity_fbeta2'] - closed_models_metrics['proximity_fbeta2']:+20.3f}")
 
@@ -532,7 +637,15 @@ def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
           f"{finetuned_metrics['proximity_precision']:<25.3f} "
           f"{finetuned_metrics['proximity_precision'] - closed_models_metrics['proximity_precision']:+20.3f}")
 
+    _append_msg(f"{'Precision':<20} {closed_models_metrics['proximity_precision']:<25.3f} "
+          f"{finetuned_metrics['proximity_precision']:<25.3f} "
+          f"{finetuned_metrics['proximity_precision'] - closed_models_metrics['proximity_precision']:+20.3f}")
+
     print(f"{'Recall':<20} {closed_models_metrics['proximity_recall']:<25.3f} "
+          f"{finetuned_metrics['proximity_recall']:<25.3f} "
+          f"{finetuned_metrics['proximity_recall'] - closed_models_metrics['proximity_recall']:+20.3f}")
+
+    _append_msg(f"{'Recall':<20} {closed_models_metrics['proximity_recall']:<25.3f} "
           f"{finetuned_metrics['proximity_recall']:<25.3f} "
           f"{finetuned_metrics['proximity_recall'] - closed_models_metrics['proximity_recall']:+20.3f}")
 
@@ -540,12 +653,23 @@ def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
           f"{finetuned_metrics['proximity_f1']:<25.3f} "
           f"{finetuned_metrics['proximity_f1'] - closed_models_metrics['proximity_f1']:+20.3f}")
 
+    _append_msg(f"{'F1':<20} {closed_models_metrics['proximity_f1']:<25.3f} "
+          f"{finetuned_metrics['proximity_f1']:<25.3f} "
+          f"{finetuned_metrics['proximity_f1'] - closed_models_metrics['proximity_f1']:+20.3f}")
+
     # Per-class metrics with tolerance
     print("\n" + "─" * 120)
     print("PER-CLASS METRICS: SWITCH→AUTO (with 5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Closed Models':<25} {'ALTO BeRT':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {f'{CLOSED_MODEL_NAME}':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
+
+    _append_msg(f"{'─' * 120}")
+    _append_msg("PER-CLASS METRICS: SWITCH→AUTO (with 5-token tolerance)")
+    _append_msg(f"{'─' * 120}")
+    _append_msg(f"{'Metric':<20} {f'{CLOSED_MODEL_NAME}':<25} {'ALTO BeRT':<25} {'Difference':<20}")
+    _append_msg(f"{'─' * 120}")
+
 
     # Use the values directly from metrics dictionary OR calculate from counts
     # For Switch→Auto
@@ -578,11 +702,23 @@ def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
           f"{finetuned_metrics.get('to_auto_proximity_fbeta2', 0):<25.3f} "
           f"{finetuned_metrics.get('to_auto_proximity_fbeta2', 0) - closed_models_metrics.get('to_auto_proximity_fbeta2', 0):+20.3f}")
 
+    _append_msg(f"{'F-beta(2)':<20} {closed_models_metrics.get('to_auto_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_auto_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_auto_proximity_fbeta2', 0) - closed_models_metrics.get('to_auto_proximity_fbeta2', 0):+20.3f}")
+
     print(f"{'Precision':<20} {b_auto_precision:<25.3f} "
           f"{f_auto_precision:<25.3f} "
           f"{f_auto_precision - b_auto_precision:+20.3f}")
 
+    _append_msg(f"{'Precision':<20} {b_auto_precision:<25.3f} "
+          f"{f_auto_precision:<25.3f} "
+          f"{f_auto_precision - b_auto_precision:+20.3f}")
+
     print(f"{'Recall':<20} {b_auto_recall:<25.3f} "
+          f"{f_auto_recall:<25.3f} "
+          f"{f_auto_recall - b_auto_recall:+20.3f}")
+
+    _append_msg(f"{'Recall':<20} {b_auto_recall:<25.3f} "
           f"{f_auto_recall:<25.3f} "
           f"{f_auto_recall - b_auto_recall:+20.3f}")
 
@@ -596,15 +732,29 @@ def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
           f"{f_auto_f1:<25.3f} "
           f"{f_auto_f1 - b_auto_f1:+20.3f}")
 
+    _append_msg(f"{'F1':<20} {b_auto_f1:<25.3f} "
+          f"{f_auto_f1:<25.3f} "
+          f"{f_auto_f1 - b_auto_f1:+20.3f}")
+
     print(f"{'Support (count)':<20} {closed_models_metrics.get('true_to_auto', 0):<25} "
+          f"{finetuned_metrics.get('true_to_auto', 0):<25} "
+          f"{'(same test set)':<20}")
+    
+    _append_msg(f"{'Support (count)':<20} {closed_models_metrics.get('true_to_auto', 0):<25} "
           f"{finetuned_metrics.get('true_to_auto', 0):<25} "
           f"{'(same test set)':<20}")
 
     print("\n" + "─" * 120)
     print("PER-CLASS METRICS: SWITCH→ALLO (with 5-token tolerance)")
     print("─" * 120)
-    print(f"{'Metric':<20} {'Closed Models':<25} {'ALTO BeRT':<25} {'Difference':<20}")
+    print(f"{'Metric':<20} {f'{CLOSED_MODEL_NAME}':<25} {'ALTO BeRT':<25} {'Difference':<20}")
     print("-" * 120)
+
+    _append_msg(f"{'─' * 120}")
+    _append_msg("PER-CLASS METRICS: SWITCH→ALLO (with 5-token tolerance)")
+    _append_msg(f"{'─' * 120}")
+    _append_msg(f"{'Metric':<20} {f'{CLOSED_MODEL_NAME}':<25} {'ALTO BeRT':<25} {'Difference':<20}")
+    _append_msg(f"{'─' * 120}")
 
     # For Switch→Allo
     if 'to_allo_proximity_precision' in closed_models_metrics:
@@ -635,11 +785,23 @@ def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
           f"{finetuned_metrics.get('to_allo_proximity_fbeta2', 0):<25.3f} "
           f"{finetuned_metrics.get('to_allo_proximity_fbeta2', 0) - closed_models_metrics.get('to_allo_proximity_fbeta2', 0):+20.3f}")
 
+    _append_msg(f"{'F-beta(2)':<20} {closed_models_metrics.get('to_allo_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_allo_proximity_fbeta2', 0):<25.3f} "
+          f"{finetuned_metrics.get('to_allo_proximity_fbeta2', 0) - closed_models_metrics.get('to_allo_proximity_fbeta2', 0):+20.3f}")
+
     print(f"{'Precision':<20} {b_allo_precision:<25.3f} "
           f"{f_allo_precision:<25.3f} "
           f"{f_allo_precision - b_allo_precision:+20.3f}")
 
+    _append_msg(f"{'Precision':<20} {b_allo_precision:<25.3f} "
+          f"{f_allo_precision:<25.3f} "
+          f"{f_allo_precision - b_allo_precision:+20.3f}")
+
     print(f"{'Recall':<20} {b_allo_recall:<25.3f} "
+          f"{f_allo_recall:<25.3f} "
+          f"{f_allo_recall - b_allo_recall:+20.3f}")
+
+    _append_msg(f"{'Recall':<20} {b_allo_recall:<25.3f} "
           f"{f_allo_recall:<25.3f} "
           f"{f_allo_recall - b_allo_recall:+20.3f}")
 
@@ -653,7 +815,15 @@ def print_fbeta_comparison(closed_models_metrics, finetuned_metrics):
           f"{f_allo_f1:<25.3f} "
           f"{f_allo_f1 - b_allo_f1:+20.3f}")
 
+    _append_msg(f"{'F1':<20} {b_allo_f1:<25.3f} "
+          f"{f_allo_f1:<25.3f} "
+          f"{f_allo_f1 - b_allo_f1:+20.3f}")
+
     print(f"{'Support (count)':<20} {closed_models_metrics.get('true_to_allo', 0):<25} "
+          f"{finetuned_metrics.get('true_to_allo', 0):<25} "
+          f"{'(same test set)':<20}")
+
+    _append_msg(f"{'Support (count)':<20} {closed_models_metrics.get('true_to_allo', 0):<25} "
           f"{finetuned_metrics.get('true_to_allo', 0):<25} "
           f"{'(same test set)':<20}")
 
@@ -674,6 +844,10 @@ def show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model,
     print("\n" + "=" * 120)
     print("DETAILED SEGMENT-BY-SEGMENT COMPARISON")
     print("=" * 120)
+
+    _append_msg(f"\n{'=' * 120}")
+    _append_msg("DETAILED SEGMENT-BY-SEGMENT COMPARISON")
+    _append_msg(f"{'=' * 120}")
 
     # Sample random segments
     sample_indices = np.random.choice(len(test_df), min(num_examples, len(test_df)), replace=False)
@@ -701,23 +875,42 @@ def show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model,
         print(f"Length: {len(tokens)} tokens | True switches: {sum(1 for l in true_labels if l in [2, 3])}")
         print(f"{'─' * 120}")
 
+        _append_msg(f"{'─' * 120}")
+        _append_msg(f"SEGMENT {ex_num} | File: {row['source_file'][:60]}...")
+        _append_msg(f"Length: {len(tokens)} tokens | True switches: {sum(1 for l in true_labels if l in [2, 3])}")
+        _append_msg(f"{'─' * 120}")
+
         # Calculate metrics for this segment
         seg_closed_models_metrics = evaluate_switch_detection_with_proximity(true_labels, closed_models_pred, tolerance=5)
         seg_ft_metrics = evaluate_switch_detection_with_proximity(true_labels, ft_pred, tolerance=5)
 
         print(f"\nSegment Metrics:")
-        print(f"  Closed Models - F-beta(2): {seg_closed_models_metrics['proximity_fbeta2']:.3f} | "
+        print(f"  {CLOSED_MODEL_NAME} - F-beta(2): {seg_closed_models_metrics['proximity_fbeta2']:.3f} | "
               f"Precision: {seg_closed_models_metrics['proximity_precision']:.3f} | "
               f"Recall: {seg_closed_models_metrics['proximity_recall']:.3f}")
         print(f"  Fine-tuned   - F-beta(2): {seg_ft_metrics['proximity_fbeta2']:.3f} | "
               f"Precision: {seg_ft_metrics['proximity_precision']:.3f} | "
               f"Recall: {seg_ft_metrics['proximity_recall']:.3f}")
 
+
+        _append_msg(f"\nSegment Metrics:")
+        _append_msg(f"  {CLOSED_MODEL_NAME} - F-beta(2): {seg_closed_models_metrics['proximity_fbeta2']:.3f} | "
+              f"Precision: {seg_closed_models_metrics['proximity_precision']:.3f} | "
+              f"Recall: {seg_closed_models_metrics['proximity_recall']:.3f}")
+        _append_msg(f"  Fine-tuned   - F-beta(2): {seg_ft_metrics['proximity_fbeta2']:.3f} | "
+              f"Precision: {seg_ft_metrics['proximity_precision']:.3f} | "
+              f"Recall: {seg_ft_metrics['proximity_recall']:.3f}")
+
         # Show detailed comparison
         print(f"\nToken-by-token comparison (showing first 40 tokens):")
         print(f"{'─' * 120}")
-        print(f"{'Pos':<5} {'Token':<15} {'True Label':<10} {'Closed Models':<12} {'Fine-tuned':<12} {'Match'}")
+        print(f"{'Pos':<5} {'Token':<12} {'True Label':<10} {f'{CLOSED_MODEL_NAME}':<20} {'Fine-tuned':<12} {'Match'}")
         print(f"{'─' * 120}")
+
+        _append_msg("\nToken-by-token comparison (showing first 40 tokens):")
+        _append_msg(f"{'─' * 120}")
+        _append_msg(f"{'Pos':<5} {'Token':<12} {'True Label':<10} {f'{CLOSED_MODEL_NAME}':<20} {'Fine-tuned':<12} {'Match'}")
+        _append_msg(f"{'─' * 120}")
 
         for i in range(min(40, len(tokens))):
             token = tokens[i][:14]
@@ -731,10 +924,12 @@ def show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model,
 
             if true_labels[i] in [2, 3]:
                 print(
-                    f"[{i:3d}] {token:<15} **{true_label:<10} {closed_models_label:<10}{closed_models_match}  {ft_label:<10}{ft_match}")
+                    f"[{i:3d}] {token:<14} **{true_label:<12} {closed_models_label:<14}{closed_models_match}  {ft_label:<9}{ft_match}")
+                _append_msg(f"[{i:3d}] {token:<14} **{true_label:<12} {closed_models_label:<14}{closed_models_match}  {ft_label:<9}{ft_match}")
             else:
                 print(
-                    f"[{i:3d}] {token:<15} {true_label:<10} {closed_models_label:<10}{closed_models_match}  {ft_label:<10}{ft_match}")
+                    f"[{i:3d}] {token:<14} {true_label:<12} {closed_models_label:<14}{closed_models_match}  {ft_label:<9}{ft_match}")
+                _append_msg(f"[{i:3d}] {token:<14} {true_label:<12} {closed_models_label:<14}{closed_models_match}  {ft_label:<9}{ft_match}")
 
         # Show switch regions in detail
         true_switches = [(i, true_labels[i]) for i in range(len(true_labels)) if true_labels[i] in [2, 3]]
@@ -744,14 +939,21 @@ def show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model,
             print(f"DETAILED VIEW AT SWITCH POINTS:")
             print(f"{'─' * 120}")
 
+            _append_msg(f"{'─' * 120}")
+            _append_msg(f"DETAILED VIEW AT SWITCH POINTS:")
+            _append_msg(f"{'─' * 120}")
+
             for switch_idx, switch_type in true_switches[:5]:  # Show first 5 switches
                 print(f"\nSwitch at position {switch_idx}: {label_names[switch_type]}")
-
+                _append_msg(f"\nSwitch at position {switch_idx}: {label_names[switch_type]}")
                 start = max(0, switch_idx - 3)
                 end = min(len(tokens), switch_idx + 4)
 
-                print(f"{'Pos':<8} {'Token':<15} {'True':<10} {'Closed Models':<10} {'Fine-tuned':<10}")
+                print(f"{'Pos':<8} {'Token':<15} {'True':<10} {f'{CLOSED_MODEL_NAME}':<25} {'Fine-tuned':<10}")
                 print("-" * 60)
+
+                _append_msg(f"{'Pos':<8} {'Token':<15} {'True':<10} {f'{CLOSED_MODEL_NAME}':<25} {'Fine-tuned':<10}")
+                _append_msg(f"{'─' * 60}")
 
                 for pos in range(start, end):
                     marker = ">>>" if pos == switch_idx else "   "
@@ -762,13 +964,17 @@ def show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model,
 
                     if pos == switch_idx:
                         # Highlight the switch point
-                        print(f"{marker} [{pos:3d}] {token:<15} {true_label:<10} {closed_models_label:<10} {ft_label:<10}")
+                        print(f"{marker} [{pos:3d}] {token:<14} {true_label:<16} {closed_models_label:<22} {ft_label:<10}")
+                        _append_msg(f"{marker} [{pos:3d}] {token:<14} {true_label:<16} {closed_models_label:<22} {ft_label:<10}")
                     else:
-                        print(f"    [{pos:3d}] {token:<15} {true_label:<10} {closed_models_label:<10} {ft_label:<10}")
+                        print(f"    [{pos:3d}] {token:<14} {true_label:<16} {closed_models_label:<22} {ft_label:<10}")
+                        _append_msg(f"    [{pos:3d}] {token:<14} {true_label:<16} {closed_models_label:<22} {ft_label:<10}")
 
         # Summary for this segment
         print(f"\n{'─' * 120}")
         print(f"Summary for Segment {ex_num}:")
+        _append_msg(f"{'─' * 120}")
+        _append_msg(f"Summary for Segment {ex_num}:")
         true_auto_switches = sum(1 for l in true_labels if l == 2)
         true_allo_switches = sum(1 for l in true_labels if l == 3)
         closed_models_auto_switches = sum(1 for l in closed_models_pred if l == 2)
@@ -777,8 +983,12 @@ def show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model,
         ft_allo_switches = sum(1 for l in ft_pred if l == 3)
 
         print(f"  True Labels:    {true_auto_switches} →AUTO, {true_allo_switches} →ALLO")
-        print(f"  Closed Models:   {closed_models_auto_switches} →AUTO, {closed_models_allo_switches} →ALLO")
+        print(f"  {CLOSED_MODEL_NAME}:   {closed_models_auto_switches} →AUTO, {closed_models_allo_switches} →ALLO")
         print(f"  Fine-tuned:     {ft_auto_switches} →AUTO, {ft_allo_switches} →ALLO")
+
+        _append_msg(f"  True Labels:    {true_auto_switches} →AUTO, {true_allo_switches} →ALLO")
+        _append_msg(f"  {CLOSED_MODEL_NAME}:   {closed_models_auto_switches} →AUTO, {closed_models_allo_switches} →ALLO")
+        _append_msg(f"  Fine-tuned:     {ft_auto_switches} →AUTO, {ft_allo_switches} →ALLO")
 
 if __name__ == "__main__":
     closed_models_metrics, finetuned_metrics = unified_evaluation()
@@ -787,10 +997,12 @@ if __name__ == "__main__":
 
     # Load models for detailed comparison
     print("\n\nLoading models for detailed segment comparisons...")
+    _append_msg("\n\nLoading models for detailed segment comparisons...")
 
     TEST_FILE = './dataset/annotated-data/test_segments.csv'
     test_df = pd.read_csv(TEST_FILE)
-
+    if USE_FEW_SHOT:
+        test_df = test_df.loc[3:].reset_index(drop=True)
 
     model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data_no_labels_no_partial"
     # model_id = "levshechter/tibetan-CS-detector_mbert-tibetan-continual-wylie_all_data"
@@ -803,3 +1015,6 @@ if __name__ == "__main__":
 
     # Show detailed comparisons
     show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model, num_examples=1)
+
+    REPORT_FILE = f"./closed-models/fine_tuned_vs_{config.get('model_name', 'gemini-2.5-flash')}_{'few_shot' if USE_FEW_SHOT else 'zero_shot'}.log"
+    utils.write_report(messages, REPORT_FILE)
