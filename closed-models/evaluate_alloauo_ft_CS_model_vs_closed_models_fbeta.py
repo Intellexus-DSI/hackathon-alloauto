@@ -25,7 +25,11 @@ def _append_msg(msg: str) -> None:
 config = utils.load_config()
 USE_FEW_SHOT = config.get('few_shot', False)
 CLOSED_MODEL_NAME = config.get('model_name', 'gemini-2.5-flash') 
-CLOSED_MODELS_RESULTS_FILE = f"./closed-models/results/results_{config.get('model_name', 'gemini-2.5-flash')}.jsonl"
+if CLOSED_MODEL_NAME == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
+    CLOSED_MODEL_NAME = "Llama-4-Scout-17B-16E-Instruct"
+elif CLOSED_MODEL_NAME == "Qwen/Qwen2.5-VL-72B-Instruct":
+    CLOSED_MODEL_NAME = "Qwen2.5-VL-72B-Instruct"
+CLOSED_MODELS_RESULTS_FILE = f"./closed-models/results/results_{CLOSED_MODEL_NAME}.jsonl"
 
 def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance=5):
     """
@@ -1023,5 +1027,5 @@ if __name__ == "__main__":
     # Show detailed comparisons
     show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model, num_examples=1)
 
-    REPORT_FILE = f"./closed-models/reports/fine_tuned_vs_{config.get('model_name', 'gemini-2.5-flash')}.log"
+    REPORT_FILE = f"./closed-models/reports/fine_tuned_vs_{CLOSED_MODEL_NAME}.log"
     utils.write_report(messages, REPORT_FILE)
