@@ -24,7 +24,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 print(f"Number of GPUs available: {torch.cuda.device_count()}")
 for i in range(torch.cuda.device_count()):
     print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-
+from post_processing_for_fine_tuned_model import verify_post_processing_rules
 
 # ============================================================================
 # FIXED POST-PROCESSING MODULE
@@ -135,27 +135,32 @@ class EvaluationConfig:
     alto_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_allow_non_switch_test_train_and_fixed_loss_7_10_no_same_seqnence_simpler_loss/final_model'
     # alto_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_allow_non_switch_test_train_and_fixed_loss_6_10/final_model'
     crf_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/crf_for_ALTO_allow_non_switch_test_train_and_fixed_loss_6_10'
+    alto_v2_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_allow_non_switch_test_train_and_fixed_loss_7_10_loss_segment_aware/final_model'
 
     min_tokens_between_switches: int = 2
 
     model_names: List[str] = None
 
+    cino_model_path: str = './alloauto-segmentation-training/benchmark_models/CINO_baseline_model_clean_train/final_model'
+    tibetan_roberta_model_path: str = './alloauto-segmentation-training/benchmark_models/tibetan-roberta_baseline_model_clean_train/final_model'
+
     def __post_init__(self):
         if self.model_names is None:
             self.model_names = [
                 'Random',
-                'Binary',
                 'mBERT',
                 'mBERT+PP',
                 'XLM-R',
                 'XLM-R+PP',
+                'CINO',
+                'CINO+PP',
+                'Tibetan-RoBERTa',
+                'Tibetan-RoBERTa+PP',
                 'ALTO',
-                'ALTO+Constraints',
                 'ALTO+PP',
-                'CRF-Model',
-                'CRF-Model+PP'
+                'ALTO-V2',        # ADD THESE TWO LINES
+                'ALTO-V2+PP',     # ADD THESE TWO LINES
             ]
-
 
 # ============================================================================
 # MODEL PROCESSORS
@@ -447,6 +452,77 @@ class ModelManager:
         self.tokenizers = {}
 
     def load_all_models(self):
+        print("Loading all models...")
+
+        # Binary
+        self.tokenizers['Binary'] = AutoTokenizer.from_pretrained(self.config.binary_model_path)
+        self.models['Binary'] = ort.InferenceSession(f'{self.config.binary_model_path}/onnx/model.onnx')
+
+        # mBERT
+        self.tokenizers['mBERT'] = AutoTokenizer.from_pretrained(self.config.mbert_model_path)
+        self.models['mBERT'] = AutoModelForTokenClassification.from_pretrained(self.config.mbert_model_path).eval().to(
+            self.config.device)
+        self.tokenizers['mBERT+PP'] = self.tokenizers['mBERT'];
+        self.models['mBERT+PP'] = self.models['mBERT']
+
+        # XLM-R
+        self.tokenizers['XLM-R'] = AutoTokenizer.from_pretrained(self.config.xlmr_model_path)
+        self.models['XLM-R'] = AutoModelForTokenClassification.from_pretrained(self.config.xlmr_model_path).eval().to(
+            self.config.device)
+        self.tokenizers['XLM-R+PP'] = self.tokenizers['XLM-R'];
+        self.models['XLM-R+PP'] = self.models['XLM-R']
+
+        # NEW: CINO
+        self.tokenizers['CINO'] = AutoTokenizer.from_pretrained(self.config.cino_model_path)
+
+        # self.tokenizers['CINO'] = AutoTokenizer.from_pretrained(self.config.cino_model_path, use_fast=False,
+        #                                                         add_prefix_space=True)
+        self.models['CINO'] = AutoModelForTokenClassification.from_pretrained(self.config.cino_model_path).eval().to(
+            self.config.device)
+        self.tokenizers['CINO+PP'] = self.tokenizers['CINO'];
+        self.models['CINO+PP'] = self.models['CINO']
+
+        # NEW: Tibetan-RoBERTa
+        self.tokenizers['Tibetan-RoBERTa'] = AutoTokenizer.from_pretrained(self.config.tibetan_roberta_model_path,
+                                                                           use_fast=True, add_prefix_space=True)
+        self.models['Tibetan-RoBERTa'] = AutoModelForTokenClassification.from_pretrained(
+            self.config.tibetan_roberta_model_path).eval().to(self.config.device)
+        self.tokenizers['Tibetan-RoBERTa+PP'] = self.tokenizers['Tibetan-RoBERTa']
+        self.models['Tibetan-RoBERTa+PP'] = self.models['Tibetan-RoBERTa']
+
+        # ALTO
+        self.tokenizers['ALTO'] = AutoTokenizer.from_pretrained(self.config.alto_model_path)
+        self.models['ALTO'] = AutoModelForTokenClassification.from_pretrained(self.config.alto_model_path).eval().to(
+            self.config.device)
+        self.tokenizers['ALTO+Constraints'] = self.tokenizers['ALTO']
+        self.models['ALTO+Constraints'] = self.models['ALTO']
+        self.tokenizers['ALTO+PP'] = self.tokenizers['ALTO']
+        self.models['ALTO+PP'] = self.models['ALTO']
+        #ALTO V2
+        self.tokenizers['ALTO-V2'] = AutoTokenizer.from_pretrained(self.config.alto_v2_model_path)
+        self.models['ALTO-V2'] = AutoModelForTokenClassification.from_pretrained(
+            self.config.alto_v2_model_path).eval().to(self.config.device)
+        self.tokenizers['ALTO-V2+PP'] = self.tokenizers['ALTO-V2']
+        self.models['ALTO-V2+PP'] = self.models['ALTO-V2']
+
+        # CRF (optional)
+        try:
+            from fine_tune_CS_4_classes_clean_no_allo_auto_labels_CRF import BERTWithCRFWrapper
+            self.tokenizers['CRF-Model'] = AutoTokenizer.from_pretrained(self.config.crf_model_path)
+            self.models['CRF-Model'] = BERTWithCRFWrapper.from_pretrained(self.config.crf_model_path).eval().to(
+                self.config.device)
+            self.tokenizers['CRF-Model+PP'] = self.tokenizers['CRF-Model'];
+            self.models['CRF-Model+PP'] = self.models['CRF-Model']
+            print("✓ CRF model loaded")
+        except Exception as e:
+            print(f"⚠️ CRF model not loaded: {e}")
+            self.config.model_names = [m for m in self.config.model_names if
+                                       'CRF' in m or 'CRF' not in m]  # no-op clean; keep your existing logic
+
+        print(f"✓ Loaded {len(set(self.models.values()))} unique models ({len(self.models)} variants)")
+        return self
+
+    def load_all_models_old(self):
         """Load all models including PP variants"""
         print("Loading all models...")
 
@@ -537,6 +613,25 @@ class ModelManager:
                 raw_preds[:len(tokens)],
                 min_tokens_between_switches=self.config.min_tokens_between_switches
             )
+            print(verify_post_processing_rules(preds))  # should show empty lists for adjacent/insufficient/invalid
+
+        elif model_name == 'CINO':
+            preds = process_finetuned_model(tokens, self.tokenizers['CINO'], self.models['CINO'], self.config.device)
+
+        elif model_name == 'CINO+PP':
+            raw = process_finetuned_model(tokens, self.tokenizers['CINO'], self.models['CINO'], self.config.device)
+            preds = apply_post_processing_rules(raw[:len(tokens)],
+                                                min_tokens_between_switches=self.config.min_tokens_between_switches)
+
+        elif model_name == 'Tibetan-RoBERTa':
+            preds = process_finetuned_model(tokens, self.tokenizers['Tibetan-RoBERTa'], self.models['Tibetan-RoBERTa'],
+                                            self.config.device)
+
+        elif model_name == 'Tibetan-RoBERTa+PP':
+            raw = process_finetuned_model(tokens, self.tokenizers['Tibetan-RoBERTa'], self.models['Tibetan-RoBERTa'],
+                                          self.config.device)
+            preds = apply_post_processing_rules(raw[:len(tokens)],
+                                                min_tokens_between_switches=self.config.min_tokens_between_switches)
 
         elif model_name == 'ALTO':
             preds = process_finetuned_model(
@@ -566,6 +661,19 @@ class ModelManager:
         elif model_name == 'CRF-Model+PP':
             raw_preds = process_crf_model_fixed(
                 tokens, self.tokenizers['CRF-Model'], self.models['CRF-Model'], self.config.device
+            )
+            preds = apply_post_processing_rules(
+                raw_preds[:len(tokens)],
+                min_tokens_between_switches=self.config.min_tokens_between_switches
+            )
+        elif model_name == 'ALTO-V2':
+            preds = process_finetuned_model(
+                tokens, self.tokenizers['ALTO-V2'], self.models['ALTO-V2'], self.config.device
+            )
+
+        elif model_name == 'ALTO-V2+PP':
+            raw_preds = process_finetuned_model(
+                tokens, self.tokenizers['ALTO-V2'], self.models['ALTO-V2'], self.config.device
             )
             preds = apply_post_processing_rules(
                 raw_preds[:len(tokens)],
@@ -629,6 +737,16 @@ class ComprehensiveEvaluator:
             'switch': {name: [] for name in self.config.model_names},
             'no_switch': {name: [] for name in self.config.model_names}
         }
+        diag_accum = {
+            name: {
+                "pair_count": 0,
+                "gaps": [],
+                "adjacent_pairs": 0,
+                "single_gap_pairs": 0,
+                "same_type_pairs": 0,
+                "max_same_type_run": 0,
+            } for name in self.config.model_names
+        }
 
         # Process each segment
         for idx, row in test_df.iterrows():
@@ -662,6 +780,16 @@ class ComprehensiveEvaluator:
                 segment_result = evaluate_switch_detection_with_proximity(
                     segment_true, preds, self.config.tolerance
                 )
+                diag = switch_sequence_diagnostics(preds)
+                acc = diag_accum[model_name]
+                acc["pair_count"] += diag["pair_count"]
+                acc["adjacent_pairs"] += diag["adjacent_pairs"]
+                acc["single_gap_pairs"] += diag["single_gap_pairs"]
+                acc["same_type_pairs"] += diag["same_type_pairs"]
+                # keep max run across segments
+                acc["max_same_type_run"] = max(acc["max_same_type_run"], diag["max_same_type_run"])
+                # collect gaps for mean/median/min/max
+                acc["gaps"].extend(diag["gaps"])
 
                 # Add to appropriate categories
                 segment_metrics['all'][model_name].append(segment_result)
@@ -727,8 +855,25 @@ class ComprehensiveEvaluator:
                     'proximity_matches': proximity_matches,
                     'segment_count': len(metrics)
                 }
-
-        return self.results, segment_metrics
+        self.switch_diagnostics = {}
+        for name, acc in diag_accum.items():
+            gaps = acc["gaps"]
+            pair_count = acc["pair_count"]
+            self.switch_diagnostics[name] = {
+                "pairs": pair_count,
+                "mean_gap": float(np.mean(gaps)) if gaps else 0.0,
+                "median_gap": float(np.median(gaps)) if gaps else 0.0,
+                "min_gap": int(np.min(gaps)) if gaps else 0,
+                "max_gap": int(np.max(gaps)) if gaps else 0,
+                "adjacent_pairs": acc["adjacent_pairs"],  # gaps == 0
+                "single_gap_pairs": acc["single_gap_pairs"],  # gaps == 1
+                "same_type_pairs": acc["same_type_pairs"],  # e.g., 3,3 or 2,2
+                "max_same_type_run": acc["max_same_type_run"],  # longest run length
+                "pct_adjacent": (acc["adjacent_pairs"] / pair_count) if pair_count else 0.0,
+                "pct_single_gap": (acc["single_gap_pairs"] / pair_count) if pair_count else 0.0,
+                "pct_same_type_consec": (acc["same_type_pairs"] / pair_count) if pair_count else 0.0,
+            }
+        return self.results, segment_metrics, self.switch_diagnostics
 
 
 # ============================================================================
@@ -741,7 +886,67 @@ class ComprehensiveReporter:
     def __init__(self, config: EvaluationConfig):
         self.config = config
 
-    def print_all_results(self, results: Dict):
+    def _print_winner_summary(self, results: Dict):
+        """Print summary of which models win the most metrics across categories"""
+        print("\n" + "=" * 200)
+        print("BEST PERFORMER SUMMARY ACROSS ALL CATEGORIES")
+        print("=" * 200)
+
+        # Count wins per model
+        win_counts = {model: 0 for model in self.config.model_names}
+        win_details = {model: [] for model in self.config.model_names}
+
+        categories = [
+            ('ALL', results['all']),
+            ('SWITCH', results['switch']),
+            ('NO_SWITCH', results['no_switch'])
+        ]
+
+        metrics = [
+            ('F-β(2)', 'proximity_fbeta2'),
+            ('Precision', 'proximity_precision'),
+            ('Recall', 'proximity_recall'),
+            ('F1', 'proximity_f1'),
+            ('Mode Accuracy', 'mode_accuracy')
+        ]
+
+        for cat_name, cat_results in categories:
+            for metric_name, metric_key in metrics:
+                # Skip mode accuracy for switch segments
+                if metric_key == 'mode_accuracy' and cat_name == 'SWITCH':
+                    continue
+
+                # Find best value and models
+                best_val = 0
+                best_models = []
+
+                for model in self.config.model_names:
+                    if model in cat_results:
+                        val = cat_results[model].get(metric_key, 0)
+                        if val > best_val:
+                            best_val = val
+                            best_models = [model]
+                        elif val == best_val and val > 0:
+                            best_models.append(model)
+
+                # Award wins
+                for model in best_models:
+                    win_counts[model] += 1
+                    win_details[model].append(f"{cat_name}-{metric_name}")
+
+        # Sort by win count
+        sorted_models = sorted(win_counts.items(), key=lambda x: x[1], reverse=True)
+
+        print(f"\n{'Model':<22} {'Wins':<8} {'Winning Metrics'}")
+        print("-" * 80)
+
+        for model, wins in sorted_models:
+            if wins > 0:
+                details = ", ".join(win_details[model][:3])  # Show first 3
+                if len(win_details[model]) > 3:
+                    details += f", ... (+{len(win_details[model]) - 3} more)"
+                print(f"{model:<22} {wins:<8} {details}")
+    def print_all_results(self, results: Dict, switch_diagnostics):
         """Print comprehensive results for all categories"""
 
         # 1. Overall results (all segments)
@@ -752,57 +957,88 @@ class ComprehensiveReporter:
 
         # 3. Non-switch segments only
         self._print_category_table(results['no_switch'], "SEGMENTS WITHOUT SWITCHES ONLY", include_mode_accuracy=True)
-
+        self._print_winner_summary(results)
         # 4. Post-processing impact analysis
         self._print_pp_impact_analysis(results)
 
         # 5. Summary and rankings
         self._print_summary_rankings(results)
+        # if hasattr(self, 'switch_diagnostics'):  # not strictly needed; safer if called elsewhere
+        self._print_switch_diagnostics(switch_diagnostics)
 
     def _print_category_table(self, category_results: Dict, title: str, include_mode_accuracy: bool = False):
-        """Print results table for a specific category"""
+        """Print results table with models as rows and metrics as columns, marking best performers"""
         print(f"\n{'=' * 200}")
         print(f"{title} (N = {category_results[list(category_results.keys())[0]]['segment_count']} segments)")
         print(f"{'=' * 200}")
 
-        # Column width
-        col_width = 13
-
-        # Header
-        header = f"{'Metric':<25}"
-        for name in self.config.model_names:
-            if name in category_results:
-                header += f" {name:<{col_width}}"
-        print(header)
-        print("-" * 200)
-
-        # Metrics to show
+        # Define metrics to show
         metrics_to_show = [
-            ('F-beta(2)', 'proximity_fbeta2'),
+            ('F-β(2)', 'proximity_fbeta2'),
             ('Precision', 'proximity_precision'),
             ('Recall', 'proximity_recall'),
             ('F1', 'proximity_f1'),
         ]
 
         if include_mode_accuracy:
-            metrics_to_show.append(('Mode Accuracy', 'mode_accuracy'))
+            metrics_to_show.append(('Mode Acc', 'mode_accuracy'))
 
         metrics_to_show.extend([
-            ('True Switches', 'true_switches'),
-            ('Pred Switches', 'pred_switches'),
+            ('True SW', 'true_switches'),
+            ('Pred SW', 'pred_switches'),
             ('Matches', 'total_matches'),
         ])
 
-        for display, key in metrics_to_show:
-            row = f"{display:<25}"
-            for name in self.config.model_names:
-                if name in category_results:
-                    val = category_results[name].get(key, 0)
-                    if key in ['true_switches', 'pred_switches', 'total_matches']:
-                        row += f" {val:<{col_width}}"
-                    else:
-                        row += f" {val:<{col_width}.3f}"
+        # Find best value for each metric
+        best_values = {}
+        for display_name, key in metrics_to_show:
+            if key in ['true_switches', 'pred_switches', 'total_matches']:
+                # For count metrics, we don't mark "best" as they're descriptive
+                best_values[key] = None
+            else:
+                # For performance metrics, find the max
+                values = [category_results[model].get(key, 0) for model in category_results]
+                best_values[key] = max(values) if values else 0
+
+        # Column widths
+        model_col_width = 22
+        metric_col_width = 11
+
+        # Print header
+        header = f"{'Model':<{model_col_width}}"
+        for display_name, _ in metrics_to_show:
+            header += f"{display_name:>{metric_col_width}}"
+        print(header)
+        print("-" * len(header))
+
+        # Print each model's results
+        for model_name in self.config.model_names:
+            if model_name not in category_results:
+                continue
+
+            row = f"{model_name:<{model_col_width}}"
+
+            for display_name, key in metrics_to_show:
+                val = category_results[model_name].get(key, 0)
+
+                # Format value
+                if key in ['true_switches', 'pred_switches', 'total_matches']:
+                    val_str = f"{int(val):>{metric_col_width - 1}}"
+                else:
+                    val_str = f"{val:>{metric_col_width - 1}.3f}"
+
+                # Mark if best (with asterisk)
+                if best_values.get(key) is not None and val == best_values[key] and val > 0:
+                    val_str += "*"
+                else:
+                    val_str += " "
+
+                row += val_str
+
             print(row)
+
+        # Print legend
+        print("\n* = Best performer for this metric")
 
     def _print_pp_impact_analysis(self, results: Dict):
         """Analyze post-processing impact across all categories"""
@@ -814,11 +1050,14 @@ class ComprehensiveReporter:
             ('mBERT', 'mBERT+PP'),
             ('XLM-R', 'XLM-R+PP'),
             ('ALTO', 'ALTO+PP'),
+            ('ALTO-V2', 'ALTO-V2+PP'),  # ADD THIS LINE
+            ('CINO', 'CINO+PP'),
+            ('Tibetan-RoBERTa', 'Tibetan-RoBERTa+PP'),
         ]
 
         # Check if CRF is available
-        if 'CRF-Model' in results['all']:
-            model_pairs.append(('CRF-Model', 'CRF-Model+PP'))
+        # if 'CRF-Model' in results['all']:
+        #     model_pairs.append(('CRF-Model', 'CRF-Model+PP'))
 
         for category, cat_name in [('all', 'ALL SEGMENTS'),
                                    ('switch', 'SWITCH SEGMENTS'),
@@ -841,6 +1080,43 @@ class ComprehensiveReporter:
 
                     print(f"{base:<20} {base_f:<12.3f} {pp_f:<12.3f} {pp_f - base_f:+<12.3f} "
                           f"{pp_p - base_p:+<12.3f} {pp_r - base_r:+<12.3f}")
+
+    def _print_switch_diagnostics(self, switch_diag: Dict[str, Dict]):
+        print("\n" + "=" * 160)
+        print("SWITCH SPACING & REPETITION DIAGNOSTICS (predictions; ALL segments)")
+        print("=" * 160)
+
+        models = [m for m in self.config.model_names if m in switch_diag]
+        col_w = 12
+        header = (
+            f"{'Model':<22}"
+            f"{'Pairs':>{col_w}}"
+            f"{'MeanGap':>{col_w}}"
+            f"{'MedGap':>{col_w}}"
+            f"{'Min':>{col_w}}"
+            f"{'Max':>{col_w}}"
+            f"{'Adj%':>{col_w}}"  # gaps==0
+            f"{'1Gap%':>{col_w}}"  # gaps==1
+            f"{'Same%':>{col_w}}"  # consecutive same type
+            f"{'MaxRun':>{col_w}}"  # longest same-type run
+        )
+        print(header)
+        print("-" * len(header))
+
+        for m in models:
+            d = switch_diag[m]
+            print(
+                f"{m:<22}"
+                f"{d['pairs']:>{col_w}d}"
+                f"{d['mean_gap']:>{col_w}.2f}"
+                f"{d['median_gap']:>{col_w}.2f}"
+                f"{d['min_gap']:>{col_w}d}"
+                f"{d['max_gap']:>{col_w}d}"
+                f"{(100 * d['pct_adjacent']):>{col_w}.1f}"
+                f"{(100 * d['pct_single_gap']):>{col_w}.1f}"
+                f"{(100 * d['pct_same_type_consec']):>{col_w}.1f}"
+                f"{d['max_same_type_run']:>{col_w}d}"
+            )
 
     def _print_summary_rankings(self, results: Dict):
         """Print summary and rankings"""
@@ -926,13 +1202,70 @@ def run_comprehensive_evaluation(config: EvaluationConfig = None):
 
     # Run evaluation
     evaluator = ComprehensiveEvaluator(config)
-    results, segment_metrics = evaluator.evaluate_all_models(test_df, model_manager)
+    results, segment_metrics, switch_diagnostics = evaluator.evaluate_all_models(test_df, model_manager)
+
+
+
 
     # Print results
     reporter = ComprehensiveReporter(config)
-    reporter.print_all_results(results)
+    reporter.print_all_results(results, switch_diagnostics)
 
     return results, segment_metrics
+
+def _extract_switch_positions_and_types(labels):
+    """Return (positions, types) for labels that are switches {2,3}."""
+    pos, typ = [], []
+    for i, l in enumerate(labels):
+        if l in (2, 3):
+            pos.append(i)
+            typ.append(l)
+    return pos, typ
+
+
+def switch_sequence_diagnostics(pred_labels):
+    """
+    Diagnostics over predicted switches only.
+    - gaps: list of tokens-between-switches (j - i - 1)
+    - adjacent_pairs: gaps == 0
+    - single_gap_pairs: gaps == 1
+    - same_type_pairs: consecutive switch types equal (e.g., 3,3 or 2,2)
+    - max_same_type_run: longest run of same switch type in the switch stream
+    """
+    idxs, types = _extract_switch_positions_and_types(pred_labels)
+    n = len(idxs)
+    diag = {
+        "pair_count": max(0, n - 1),
+        "gaps": [],
+        "adjacent_pairs": 0,
+        "single_gap_pairs": 0,
+        "same_type_pairs": 0,
+        "max_same_type_run": 0,
+    }
+    if n <= 1:
+        return diag
+
+    # gaps & immediate issues
+    for k in range(n - 1):
+        gap_between = idxs[k + 1] - idxs[k] - 1  # tokens between the two switches
+        diag["gaps"].append(gap_between)
+        if gap_between == 0:
+            diag["adjacent_pairs"] += 1
+        if gap_between == 1:
+            diag["single_gap_pairs"] += 1
+
+    # same-type consecutive checks in switch-only stream
+    run = 1
+    for k in range(n - 1):
+        if types[k] == types[k + 1]:
+            diag["same_type_pairs"] += 1
+            run += 1
+        else:
+            diag["max_same_type_run"] = max(diag["max_same_type_run"], run)
+            run = 1
+    diag["max_same_type_run"] = max(diag["max_same_type_run"], run)
+
+    return diag
 
 
 # ============================================================================
@@ -941,3 +1274,4 @@ def run_comprehensive_evaluation(config: EvaluationConfig = None):
 
 if __name__ == "__main__":
     results, segment_metrics = run_comprehensive_evaluation()
+
