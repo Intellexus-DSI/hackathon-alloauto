@@ -12,6 +12,7 @@ import re
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 from sklearn.metrics import fbeta_score, precision_score, recall_score, f1_score
 import os
+import json
 import utils
 
 # Messages for report
@@ -24,8 +25,11 @@ def _append_msg(msg: str) -> None:
 config = utils.load_config()
 USE_FEW_SHOT = config.get('few_shot', False)
 CLOSED_MODEL_NAME = config.get('model_name', 'gemini-2.5-flash') 
-CLOSED_MODEL_NAME += '_FS' if USE_FEW_SHOT else '_ZS'
-CLOSED_MODELS_RESULTS_FILE = f"./closed-models/results/results_{'few_shot' if USE_FEW_SHOT else 'zero_shot'}_{config.get('model_name', 'gemini-2.5-flash')}.jsonl"
+if CLOSED_MODEL_NAME == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
+    CLOSED_MODEL_NAME = "Llama-4-Scout-17B-16E-Instruct"
+elif CLOSED_MODEL_NAME == "Qwen/Qwen2.5-VL-72B-Instruct":
+    CLOSED_MODEL_NAME = "Qwen2.5-VL-72B-Instruct"
+CLOSED_MODELS_RESULTS_FILE = f"./closed-models/results/results_{CLOSED_MODEL_NAME}.jsonl"
 
 def evaluate_switch_detection_with_proximity(true_labels, pred_labels, tolerance=5):
     """
@@ -353,8 +357,8 @@ def unified_evaluation():
     TEST_FILE = './dataset/annotated-data/test_segments.csv'
     TOLERANCE = 5
     
-    print(f"Using {CLOSED_MODEL_NAME[:-3]} for evaluation")
-    _append_msg(f"Using {CLOSED_MODEL_NAME[:-3]} for evaluation")
+    print(f"Using {CLOSED_MODEL_NAME} for evaluation")
+    _append_msg(f"Using {CLOSED_MODEL_NAME} for evaluation")
     print(f"Loading test data from: {TEST_FILE}")
     _append_msg(f"Loading test data from: {TEST_FILE}")
     test_df = pd.read_csv(TEST_FILE)
@@ -420,6 +424,13 @@ def unified_evaluation():
 
         all_true_labels.extend(true_labels[:min_len])
         finetuned_all_pred.extend(ft_pred[:min_len])
+
+    try:
+        print("Writing finetuned_all_pred.txt...")
+        with open("./closed-models/results/finetuned_all_pred.txt", "w") as f:
+            f.write("".join([str(x) for x in finetuned_all_pred]))
+    except Exception as e:
+        print(f"Error writing finetuned_all_pred.txt: {e}")
 
     print(f"\nTotal tokens evaluated: {len(all_true_labels)}")
     _append_msg(f"Total tokens evaluated: {len(all_true_labels)}")
@@ -1016,5 +1027,5 @@ if __name__ == "__main__":
     # Show detailed comparisons
     show_detailed_segment_comparisons(test_df, ft_tokenizer, ft_model, num_examples=1)
 
-    REPORT_FILE = f"./closed-models/fine_tuned_vs_{config.get('model_name', 'gemini-2.5-flash')}_{'few_shot' if USE_FEW_SHOT else 'zero_shot'}.log"
+    REPORT_FILE = f"./closed-models/reports/fine_tuned_vs_{CLOSED_MODEL_NAME}.log"
     utils.write_report(messages, REPORT_FILE)

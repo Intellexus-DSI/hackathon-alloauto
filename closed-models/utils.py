@@ -1,6 +1,7 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langchain_together import ChatTogether
+from langchain_anthropic import ChatAnthropic
 from langchain.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
 import os
 import json
@@ -23,8 +24,14 @@ def get_llm(temperature=0.3, model_name="gemini-2.5-flash", max_output_tokens=No
             max_tokens=max_output_tokens,
             temperature=temperature
         )
-    elif model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
+    elif model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct" or model_name == "Qwen/Qwen2.5-VL-72B-Instruct":
         return ChatTogether(
+            model=model_name,
+            max_tokens=max_output_tokens,
+            temperature=temperature
+        )
+    elif model_name == "claude-sonnet-4-5-20250929":
+        return ChatAnthropic(
             model=model_name,
             max_tokens=max_output_tokens,
             temperature=temperature

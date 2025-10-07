@@ -105,11 +105,7 @@ def main():
     
     _append_msg("=" * 50)
     # Process samples
-    predictions = []
     results = []
-    labeled_array = []
-    first_segment = ""
-    reasoning = ""
     for i, sample in tqdm(enumerate(samples), total=len(samples), desc="Processing samples"):
         input_text = sample
         total_tokens = len(input_text.split())
@@ -124,6 +120,10 @@ def main():
             tqdm.write(prompt.invoke({"text": input_text , "total_tokens": total_tokens - 1}).to_string())
         if use_few_shot:
             time.sleep(5)
+        predictions = []
+        labeled_array = []
+        first_segment = ""
+        reasoning = ""
         try:
             response = chain.invoke({"text": input_text, "total_tokens": total_tokens - 1})
             response_content = response.content if hasattr(response, 'content') else str(response)
@@ -183,6 +183,10 @@ def main():
     
     # Save results
     model_name = config.get('model_name', 'gemini-2.5-flash')
+    if model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct":
+        model_name = "Llama-4-Scout-17B-16E-Instruct"
+    elif model_name == "Qwen/Qwen2.5-VL-72B-Instruct":
+        model_name = "Qwen2.5-VL-72B-Instruct"
     try:
         results_dir = os.path.join(os.path.dirname(__file__), "results")
         os.makedirs(results_dir, exist_ok=True)
