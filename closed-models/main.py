@@ -63,7 +63,8 @@ def main():
     try:
         llm = utils.get_llm(
             temperature=config.get('temperature', 0.3),
-            model_name=config.get('model_name', "gemini-2.5-flash")
+            model_name=config.get('model_name', "gemini-2.5-flash"),
+            max_output_tokens=config.get('max_tokens', None)
         )
         _append_msg(f"✅ LLM initialized: {config.get('model_name', 'gemini-2.5-flash')}")
         logger.info(f"✅ LLM initialized: {config.get('model_name', 'gemini-2.5-flash')}")
@@ -87,7 +88,7 @@ def main():
     use_few_shot = config.get('few_shot', True)
     if use_few_shot:
         samples = samples[3:]
-
+    cot = config.get('cot', False)
     # Apply debug sampling if specified
     debug_samples = config.get('debug_samples', 0)
     if debug_samples > 0:
@@ -96,7 +97,7 @@ def main():
         logger.info(f"🐛 Debug mode: processing only {len(samples)} samples")
     
     # Get the appropriate prompt
-    prompt = utils.get_prompt(use_few_shot=use_few_shot)
+    prompt = utils.get_prompt(use_few_shot=use_few_shot, cot=cot)
     _append_msg(f'prompt:\nprompt={prompt}')
 
     # Create chain
@@ -108,6 +109,7 @@ def main():
     results = []
     labeled_array = []
     first_segment = ""
+    reasoning = ""
     for i, sample in tqdm(enumerate(samples), total=len(samples), desc="Processing samples"):
         input_text = sample
         total_tokens = len(input_text.split())
@@ -138,13 +140,16 @@ def main():
 
             predictions = result["prediction"] if "prediction" in result else []
             first_segment = result["first_segment"] if "first_segment" in result else ""
+            reasoning = result["reasoning"] if "reasoning" in result else ""
             labeled_array = utils.convert_to_labeled_array(predictions, first_segment, total_tokens)
             results.append({
                 'predictions': predictions,
                 'first_segment': first_segment,
+                'reasoning': reasoning,
                 'total_tokens': total_tokens,
                 'LLM_output': result,
                 'sample_id': i+1,
+                "usage_metadata": response.usage_metadata,
                 'approach': 'few-shot' if use_few_shot else 'zero-shot',
                 'labeled_array': labeled_array,
             })
@@ -164,6 +169,7 @@ def main():
             results.append({
                 'predictions': predictions,
                 'first_segment': first_segment,
+                'reasoning': reasoning,
                 'total_tokens': total_tokens,
                 'sample_id': i+1,
                 'input_text': input_text,
@@ -176,15 +182,14 @@ def main():
         _append_msg("-" * 30)
     
     # Save results
+    model_name = config.get('model_name', 'gemini-2.5-flash')
     try:
-        model_name = config.get('model_name', 'gemini-2.5-flash')
-        approach_name = "few_shot" if use_few_shot else "zero_shot"
         results_dir = os.path.join(os.path.dirname(__file__), "results")
         os.makedirs(results_dir, exist_ok=True)
         if debug_samples > 0:
-            output_filename = f"results_{approach_name}_{debug_samples}_samples_{model_name}.jsonl"
+            output_filename = f"results_{debug_samples}_samples_{model_name}.jsonl"
         else:   
-            output_filename = f"results_{approach_name}_{model_name}.jsonl"
+            output_filename = f"results_{model_name}.jsonl"
         output_file = os.path.join(results_dir, output_filename)
         utils.save_results(results, output_file)
         _append_msg(f"💾 Results saved to: {output_file}")
@@ -196,8 +201,15 @@ def main():
     
     logger.info("=" * 50)
     logger.info("📈 Writing report")
-    utils.write_report(messages, "./closed-models/report.log")
-    logger.info("✅ Report written to: report.log")
+    report_dir = os.path.join(os.path.dirname(__file__), "reports")
+    os.makedirs(report_dir, exist_ok=True)
+    if debug_samples > 0:
+        report_filename = f"REPORT_{debug_samples}_samples_{model_name}.log"
+    else:   
+        report_filename = f"REPORT_{model_name}.log"
+    report_file = os.path.join(report_dir, report_filename)
+    utils.write_report(messages, report_file)
+    logger.info(f"✅ Report written to: {report_file}")
 
 if __name__ == "__main__":
     main()
