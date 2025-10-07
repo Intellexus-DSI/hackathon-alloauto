@@ -1,4 +1,7 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from langchain_together import ChatTogether
+from langchain_anthropic import ChatAnthropic
 from langchain.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
 import os
 import json
@@ -7,13 +10,36 @@ import json
 import logging
 from typing import List, Generator
 
-def get_llm(temperature=0.7, model_name="gemini-2.5-flash"):
+def get_llm(temperature=0.3, model_name="gemini-2.5-flash", max_output_tokens=None):
     """Initialize LLM with specified parameters"""
-    return ChatGoogleGenerativeAI(
-        model=model_name,
-        temperature=temperature
-    )
+    if model_name == "gemini-2.5-flash" or model_name == "gemini-2.5-pro":
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature
+        )
+    elif model_name == "gpt-4o":
+        return ChatOpenAI(
+            model=model_name,
+            max_tokens=max_output_tokens,
+            temperature=temperature
+        )
+    elif model_name == "meta-llama/Llama-4-Scout-17B-16E-Instruct" or model_name == "Qwen/Qwen2.5-VL-72B-Instruct":
+        return ChatTogether(
+            model=model_name,
+            max_tokens=max_output_tokens,
+            temperature=temperature
+        )
+    elif model_name == "claude-sonnet-4-5-20250929":
+        return ChatAnthropic(
+            model=model_name,
+            max_tokens=max_output_tokens,
+            temperature=temperature
+        )
+    else:
+        raise ValueError(f"Invalid model name: {model_name}")
 
+# region Old prompts
 #=======LONG PROMPT=======#
 # PROMPT = {
 #     "system": """You are a Tibetan Buddhist philology expert and computational linguist. Read Tibetan text and segment it into contiguous spans of two types:
@@ -53,19 +79,54 @@ def get_llm(temperature=0.7, model_name="gemini-2.5-flash"):
 #=======LONG PROMPT=======#
 
 #=======SHORT PROMPT=======#
+# PROMPT_OLD = {
+#     "system": """
+#     You are a Tibetan Buddhist philology expert and computational linguist. Your task is to read Tibetan text and segment it into contiguous spans of two types:
+#     AUTO (autochthonous Tibetan): passages originally composed in Tibetan. ALLO (allochthonous Tibetan): passages translated into Tibetan (typically from Sanskrit or related Indic sources).
+#     Return only JSON of the form: ("first_segment": "allo" | "auto", "prediction": [i1, i2, ...] Each integer is a 0‑based word index that marks the start of a new segment after a label change. If there is no switch, return "prediction": [].
+#     Split the given text into words as follows:
+#     - Normalize consecutive whitespace to single spaces for counting.
+#     - first_segment is the first segment of the text, either "allo" or "auto".
+#     - The first word has index 0.
+#     - Do not include index 0 in prediction.
+#     - Indices must be integers, unique, sorted ascending, each within [1, {total_tokens}].
+#     - An index must be less than {total_tokens}.
+#     Output only the JSON object; no explanations or extra text.
+#     """,
+#     "human": "{text}\n"
+# }
+#endregion
+
 PROMPT = {
     "system": """
-    You are a Tibetan Buddhist philology expert and computational linguist. Your task is to read Tibetan text and segment it into contiguous spans of two types:
-    AUTO (autochthonous Tibetan): passages originally composed in Tibetan. ALLO (allochthonous Tibetan): passages translated into Tibetan (typically from Sanskrit or related Indic sources).
-    Return only JSON of the form: ("first_segment": "allo" | "auto", "prediction": [i1, i2, ...] Each integer is a 0‑based word index that marks the start of a new segment after a label change. If there is no switch, return "prediction": [].
-    Split the given text into words as follows:
+    You are a Tibetan Buddhist philology expert and computational linguist. 
+    Your task is to read Tibetan text and segment it into contiguous spans of two types:
+    - AUTO (autochthonous Tibetan): passages originally composed in Tibetan.
+    - ALLO (allochthonous Tibetan): passages translated into Tibetan (typically from Sanskrit or related Indic sources).
+
+    We are building a profile for Tibetan text segmentation.
+    After segmenting, you must output detailed reasoning *inside the JSON object* under the key "reasoning".
+    Do NOT include any explanations or commentary outside the JSON.
+    Return ONLY a JSON object of the form:
+    {{
+    "reasoning": "<short explanation of why and where the text switches>",
+    "first_segment": "auto" | "allo",
+    "prediction": [i1, i2, ...]
+    }}
+    Definitions:
+    - "reasoning" briefly explains in 2-3 sentences *why* you placed those boundaries (e.g., indicators of translationese, mantra markers, syntax shifts, stylistic transitions, etc.).
+    - "first_segment" is the label of the first span in the text: "auto" or "allo".
+    - "prediction" is a list of 0-based WORD indices that mark the start of a new segment after a label change.
+    - If there is no switch, output: {{"reasoning": "No clear switch detected.", "first_segment": "auto"|"allo", "prediction": []}}
+    Word indexing rules:
     - Normalize consecutive whitespace to single spaces for counting.
-    - first_segment is the first segment of the text, either "allo" or "auto".
     - The first word has index 0.
     - Do not include index 0 in prediction.
-    - Indices must be integers, unique, sorted ascending, each within [1, {total_tokens}].
-    - An index must be less than {total_tokens}.
-    Output only the JSON object; no explanations or extra text.
+    - Indices must be integers, unique, strictly ascending, each within [1, {total_tokens}].
+
+    Strict formatting:
+    - Output only valid JSON with all three keys: "reasoning", "first_segment", "prediction".
+    - Do not include any text or commentary outside the JSON.
     """,
     "human": "{text}\n"
 }
@@ -135,7 +196,6 @@ examples = [
         "input": "yod des rnal bzhin gnyid log na / de las ma rungs gzhan ci yod / ces gsungs pa dang / spyod 'jug las kyang / thams cad bor te cha dgos par / bdag gis de ltar ma shes nas / mdza' dang mi mdza'i don gyi phyir / sdig pa rnam pa sna tshogs byas / zhes gsungs so /",
         "output": '{"first_segment": "auto", "prediction": [26, 58]}'
     }
-
 ]
 
 # Define how each example should be formatted
@@ -149,10 +209,14 @@ few_shot_prompt = FewShotChatMessagePromptTemplate(
     example_prompt=example_prompt,
     examples=examples,
 )
+
+# region few-shot system prompts
 # few_shot_system = ChatPromptTemplate.from_messages([
 #     ('system', """The following Human–AI pairs are EXAMPLES."""),
 #     ('system', """END OF EXAMPLES \n """)
 # ])
+#endregion
+
 # Reuse the zero-shot prompt and add few-shot examples
 PROMPT_FEW_SHOT = ChatPromptTemplate.from_messages([
     *PROMPT_ZERO_SHOT.messages[:-1],  # All messages except the last user message
@@ -245,9 +309,11 @@ def load_results_json(file_path: str) -> Generator[dict, None, None]:
         for line in f:
             json_line = json.loads(line)
             yield {
+                'reasoning': json_line['reasoning'],
                 'first_segment': json_line['first_segment'],
                 'predictions': json_line['predictions'],
                 'total_tokens': json_line['total_tokens'],
+                'usage_metadata': json_line['usage_metadata'],
                 'labeled_array': json_line['labeled_array'],
                 'sample_id': json_line['sample_id'],
             }
