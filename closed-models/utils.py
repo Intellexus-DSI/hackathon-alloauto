@@ -207,7 +207,41 @@ REASONING_PROFILE_PROMPT = {
     """
 }
 
-PROMT_UNDERSTANDING_LABELS = {}
+PROMT_UNDERSTANDING_LABELS = {
+     "system": """
+    You are a Tibetan Buddhist philology expert and computational linguist.
+    You will receive a collection of Tibetan texts, each with its *true switch indices* that mark 
+    boundaries between AUTO (autochthonous Tibetan) and ALLO (allochthonous Tibetan).
+
+    Your task is to analyze the entire dataset as a whole and produce a concise analytical summary 
+    that describes the recurring linguistic, stylistic, and structural patterns that typically define 
+    AUTO and ALLO segments, as well as the typical cues or transitions observed at switch points.
+
+    Focus on patterns — not evaluating or predicting. Think like a researcher explaining what these 
+    switches reveal about the nature of Tibetan composition and translation.
+
+    Return only valid JSON with this structure:
+    {{
+    "key_observations": "Describe the most consistent patterns observed across the dataset — how AUTO and ALLO differ linguistically, what triggers switches, and any broader stylistic regularities.",
+    "summary": "Provide a concise research-style paragraph summarizing what this collection of gold switches reveals about Tibetan segmentation as a phenomenon (e.g., stylistic shifts, mantra inclusions, translation markers, etc.)."
+    }}
+
+    Formatting rules:
+    - Use double quotes and no trailing commas.
+    - Both keys must appear.
+    - Be analytical and textual; do not output examples or indices.
+    - Focus on aggregated insights from all texts.
+    """,
+    "human": """
+    You are given {n_samples} Tibetan texts, each with its gold switch indices.
+
+    {entries}
+
+    Analyze the full collection to discover overall segmentation patterns.
+    Explain what these true switches suggest about Tibetan AUTO vs ALLO boundaries.
+    Return only the JSON object.
+    """
+}
 
 PROMPT_REASONING_ANALYSIS = {
     "system": """
@@ -493,3 +527,10 @@ def get_true_predictions(labels_array: str) -> dict:
     pred = np.array([int(x) for x in labels_array.split(",")])
     first_segment = 'auto' if pred[0] == 0 else 'allo'
     return {"real_first_segment": first_segment, "real_predictions": np.where((pred == 2) | (pred == 3))[0].tolist()}
+
+def get_understanding_switches_prompt()-> ChatPromptTemplate:
+    """Get understanding predictions prompt"""
+    return ChatPromptTemplate.from_messages([
+        ("system", PROMT_UNDERSTANDING_LABELS["system"]),
+        ("human", PROMT_UNDERSTANDING_LABELS["human"])
+    ])
