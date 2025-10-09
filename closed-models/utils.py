@@ -9,6 +9,7 @@ import yaml
 import json
 import logging
 from typing import List, Generator
+import numpy as np
 
 def get_llm(temperature=0.3, model_name="gemini-2.5-flash", max_output_tokens=None):
     """Initialize LLM with specified parameters"""
@@ -168,6 +169,121 @@ COT_PROMPT = {
     "human": "Text: {text}\n"
 }
 
+REASONING_PROFILE_PROMPT = {
+    "system": """
+    You are a Tibetan Buddhist philology researcher and computational linguist.
+    Your task is to analyze a batch of Tibetan text segmentation examples and produce a single *global segmentation profile*.
+
+    Each example provides:
+    - The original Tibetan text.
+    - The model's predicted switch indices and reasoning.
+    - The true switch indices.
+
+    Your goal:
+    1. Identify **recurring linguistic or stylistic features** that distinguish AUTO and ALLO passages.
+    2. Note **patterns in reasoning** that match or mismatch the true switch indices.
+    3. Detect **common boundary cues** where segment transitions usually occur.
+    4. Summarize all of this as a unified profile.
+
+    Return **only valid JSON** with the structure:
+    {{
+    "key_observations": "a paragraph summarizing key observations",
+    "summary": "a paragraph summarizing global segmentation behavior"
+    }}
+
+    Formatting rules:
+    - Use double quotes, no trailing commas.
+    - Every key must appear.
+    - Write concise but analytical descriptions.
+    """,
+    "human": """
+    Analyze the following {n_samples} dataset entries:
+
+    {entries}
+
+    Derive a single comprehensive segmentation profile capturing shared AUTO vs ALLO features,
+    recurrent cues for switches, and model behavior relative to gold labels.
+    Return only the JSON profile object.
+    """
+}
+
+PROMT_UNDERSTANDING_LABELS = {
+     "system": """
+    You are a Tibetan Buddhist philology expert and computational linguist.
+    You will receive a collection of Tibetan texts, each with its *true switch indices* that mark 
+    boundaries between AUTO (autochthonous Tibetan) and ALLO (allochthonous Tibetan).
+
+    Your task is to analyze the entire dataset as a whole and produce a concise analytical summary 
+    that describes the recurring linguistic, stylistic, and structural patterns that typically define 
+    AUTO and ALLO segments, as well as the typical cues or transitions observed at switch points.
+
+    Focus on patterns — not evaluating or predicting. Think like a researcher explaining what these 
+    switches reveal about the nature of Tibetan composition and translation.
+
+    Return only valid JSON with this structure:
+    {{
+    "key_observations": "Describe the most consistent patterns observed across the dataset — how AUTO and ALLO differ linguistically, what triggers switches, and any broader stylistic regularities.",
+    "summary": "Provide a concise research-style paragraph summarizing what this collection of gold switches reveals about Tibetan segmentation as a phenomenon (e.g., stylistic shifts, mantra inclusions, translation markers, etc.)."
+    }}
+
+    Formatting rules:
+    - Use double quotes and no trailing commas.
+    - Both keys must appear.
+    - Be analytical and textual; do not output examples or indices.
+    - Focus on aggregated insights from all texts.
+    """,
+    "human": """
+    You are given {n_samples} Tibetan texts, each with its gold switch indices.
+
+    {entries}
+
+    Analyze the full collection to discover overall segmentation patterns.
+    Explain what these true switches suggest about Tibetan AUTO vs ALLO boundaries.
+    Return only the JSON object.
+    """
+}
+
+PROMPT_REASONING_ANALYSIS = {
+    "system": """
+    You are a Tibetan Buddhist philology researcher and computational linguist.
+    Your task is to analyze a batch of reasoning traces from a Tibetan segmentation model.
+    Each example includes:
+    - The original Tibetan text.
+    - The model’s reasoning for its segmentation decisions.
+    - The model’s predicted switch indices.
+    - The true (gold) switch indices.
+
+    You are NOT evaluating linguistic content or segmentation quality itself.
+    Instead, focus on the *meta-logic* behind the reasoning: how the model explains its decisions.
+
+    Your goals:
+    1. Observe **recurring reasoning patterns or motifs** that appear across examples.
+    2. Identify how these patterns relate to prediction correctness (consistent logic vs. mismatches).
+    3. Assess the **quality and coherence** of reasoning: whether it is evidence-based, repetitive, speculative, or inconsistent.
+    
+    Return **only valid JSON** with the following structure:
+    {{
+    "key_observations": "a short paragraph describing recurring reasoning patterns, logic structures, and consistency across examples. Highlight when reasoning repeats, shifts, or contradicts itself. use maximum 10 examples.",
+    "summary": "Provide a concise global evaluation of reasoning quality across all samples — how systematic, evidence-based, or error-prone it is overall."
+    }}
+
+    Formatting rules:
+    - Use double quotes, no trailing commas.
+    - Every key must appear.
+    - Focus on reasoning patterns, not segmentation details.
+    """,
+    "human": """
+    Analyze the following {n_samples} examples:
+
+    {entries}
+
+    Each example contains: Text, Model Reasoning, Model Prediction, and Gold Indices.
+    Study how the reasoning logic behaves across examples, find repeated patterns,
+    and summarize which reasoning styles lead to correct vs incorrect segmentation.
+    Return only the JSON profile object.
+    """
+}
+
 PROMPT_ZERO_SHOT =  ChatPromptTemplate.from_messages([
     ("system", PROMPT["system"]),
     ("human", PROMPT["human"])
@@ -247,7 +363,6 @@ def get_prompt(use_few_shot=False, cot=False):
     else:
         print("Using zero-shot Prompting approach")
         return PROMPT_ZERO_SHOT
-
 
 def set_env_vars(config_path="keys.yaml"):
     """Set OS env variables from a YAML configuration file."""
@@ -355,7 +470,15 @@ def fill_class_segments(results: List[dict]) -> List[List[int]]:
     return full_predictions
     
 def convert_to_labeled_array(prediction: List[int], first_segment: str, total_tokens: int) -> List[int]:
-    """Convert single prediction to array"""
+    """
+    Convert single prediction to array of labeled tokens
+    Args:
+        prediction: List[int] - List of indices where the segment changes
+        first_segment: str - The first segment of the text
+        total_tokens: int - The total number of tokens in the text
+    Returns:
+        List[int] - List of labeled tokens
+    """
     if first_segment == 'auto':
         curr_class, curr_switch_class = 0, 3
     elif first_segment == 'allo':
@@ -385,9 +508,29 @@ def convert_to_labeled_array(prediction: List[int], first_segment: str, total_to
     return labels
 
 def get_closed_models_predictions(file_path: str) -> List[int]:
-    """Get metrics for closed models predictions"""
+    """Get metrices for closed models predictions"""
     results = load_results_json(file_path)
     predictions = []
     for result in results:
         predictions.extend(result['labeled_array'])
     return predictions
+
+def get_reasoning_prompt()-> ChatPromptTemplate:
+    """Get reasoning prompt"""
+    return ChatPromptTemplate.from_messages([
+        ("system", PROMPT_REASONING_ANALYSIS["system"]),
+        ("human", PROMPT_REASONING_ANALYSIS["human"])
+    ])
+
+def get_true_predictions(labels_array: str) -> dict:
+    """Get true predictions from string array"""
+    pred = np.array([int(x) for x in labels_array.split(",")])
+    first_segment = 'auto' if pred[0] == 0 else 'allo'
+    return {"real_first_segment": first_segment, "real_predictions": np.where((pred == 2) | (pred == 3))[0].tolist()}
+
+def get_understanding_switches_prompt()-> ChatPromptTemplate:
+    """Get understanding predictions prompt"""
+    return ChatPromptTemplate.from_messages([
+        ("system", PROMT_UNDERSTANDING_LABELS["system"]),
+        ("human", PROMT_UNDERSTANDING_LABELS["human"])
+    ])
