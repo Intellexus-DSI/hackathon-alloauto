@@ -136,8 +136,9 @@ class EvaluationConfig:
     # alto_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_allow_non_switch_test_train_and_fixed_loss_6_10/final_model'
     crf_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/crf_for_ALTO_allow_non_switch_test_train_and_fixed_loss_6_10'
     alto_v2_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_allow_non_switch_test_train_and_fixed_loss_7_10_loss_segment_aware/final_model'
+    alto_3class_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_3class_converted_10_10/final_model'
     alto_focal_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_allow_non_switch_test_train_and_fixed_loss_7_10_focal_loss/final_model'
-
+    alto_v2_additive_loss_model_path: str = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_4class_additive_loss/final_model'
     min_tokens_between_switches: int = 2
 
     model_names: List[str] = None
@@ -148,6 +149,9 @@ class EvaluationConfig:
     # Add these two lines after your existing model paths:
     simple_4class_model_path: str = './alloauto-segmentation-training/benchmark_models/simple_mBert_vanilla_benchmark_4_class_NER/final_model'
     simple_3class_model_path: str = './alloauto-segmentation-training/benchmark_models/simple_mBert_vanilla_benchmark_3_class_NER/final_model'
+
+    mbert_3class_weighted_path: str = './alloauto-segmentation-training/benchmark_models/mbert_3class_baseline_model_clean_train/final_model'
+
     def __post_init__(self):
         if self.model_names is None:
             self.model_names = [
@@ -158,6 +162,8 @@ class EvaluationConfig:
                 'Simple-4Class+PP',  # ADD
                 'Simple-3Class',  # ADD
                 'Simple-3Class+PP',  # ADD
+                'mBERT-3Class-Weighted',  # ADD THIS
+                'mBERT-3Class-Weighted+PP',  # ADD THIS
                 'XLM-R',
                 'XLM-R+PP',
                 'CINO',
@@ -168,8 +174,13 @@ class EvaluationConfig:
                 'ALTO+PP',
                 'ALTO-V2',
                 'ALTO-V2+PP',
+                'ALTO-V2_ADDITIVE_LOSS',
+                'ALTO-V2_ADDITIVE_LOSS+PP',
                 'ALTO-Focal',      # ADD THESE TWO LINES
                 'ALTO-Focal+PP',   # ADD THESE TWO LINES
+                'ALTO-3Class',  # ADD THIS LINE
+                'ALTO-3Class+PP',  # ADD THIS LINE
+
             ]
 
 # ============================================================================
@@ -489,31 +500,31 @@ class ModelManager:
         self.models = {}
         self.tokenizers = {}
 
-    def load_all_models(self):
-        print("Loading all models...")
+    # def load_all_models(self):
+    #     print("Loading all models...")
+    #
+    #     # [Keep all your existing model loading code]
+    #
+    #     # NEW: Simple 4-class model
+    #     print("Loading Simple 4-class model...")
+    #     self.tokenizers['Simple-4Class'] = AutoTokenizer.from_pretrained(self.config.simple_4class_model_path)
+    #     self.models['Simple-4Class'] = AutoModelForTokenClassification.from_pretrained(
+    #         self.config.simple_4class_model_path).eval().to(self.config.device)
+    #     self.tokenizers['Simple-4Class+PP'] = self.tokenizers['Simple-4Class']
+    #     self.models['Simple-4Class+PP'] = self.models['Simple-4Class']
+    #
+    #     # NEW: Simple 3-class model
+    #     print("Loading Simple 3-class model...")
+    #     self.tokenizers['Simple-3Class'] = AutoTokenizer.from_pretrained(self.config.simple_3class_model_path)
+    #     self.models['Simple-3Class'] = AutoModelForTokenClassification.from_pretrained(
+    #         self.config.simple_3class_model_path).eval().to(self.config.device)
+    #     self.tokenizers['Simple-3Class+PP'] = self.tokenizers['Simple-3Class']
+    #     self.models['Simple-3Class+PP'] = self.models['Simple-3Class']
+    #
+    #     print(f"✓ Loaded all models including Simple 4-class and 3-class variants")
+    #     return self
 
-        # [Keep all your existing model loading code]
-
-        # NEW: Simple 4-class model
-        print("Loading Simple 4-class model...")
-        self.tokenizers['Simple-4Class'] = AutoTokenizer.from_pretrained(self.config.simple_4class_model_path)
-        self.models['Simple-4Class'] = AutoModelForTokenClassification.from_pretrained(
-            self.config.simple_4class_model_path).eval().to(self.config.device)
-        self.tokenizers['Simple-4Class+PP'] = self.tokenizers['Simple-4Class']
-        self.models['Simple-4Class+PP'] = self.models['Simple-4Class']
-
-        # NEW: Simple 3-class model
-        print("Loading Simple 3-class model...")
-        self.tokenizers['Simple-3Class'] = AutoTokenizer.from_pretrained(self.config.simple_3class_model_path)
-        self.models['Simple-3Class'] = AutoModelForTokenClassification.from_pretrained(
-            self.config.simple_3class_model_path).eval().to(self.config.device)
-        self.tokenizers['Simple-3Class+PP'] = self.tokenizers['Simple-3Class']
-        self.models['Simple-3Class+PP'] = self.models['Simple-3Class']
-
-        print(f"✓ Loaded all models including Simple 4-class and 3-class variants")
-        return self
-
-    def predict_single_segment(self, model_name: str, tokens: List[str], seed: int = 42) -> List[int]:
+    def predict_single_segment_old(self, model_name: str, tokens: List[str], seed: int = 42) -> List[int]:
         """Predict for a single segment (UPDATED with simple models)"""
 
         if model_name == 'Random':
@@ -620,12 +631,28 @@ class ModelManager:
         self.tokenizers['ALTO-V2+PP'] = self.tokenizers['ALTO-V2']
         self.models['ALTO-V2+PP'] = self.models['ALTO-V2']
 
+        #ALTO_V2_ADDITIVE_LOSS
+        self.tokenizers['ALTO-V2_ADDITIVE_LOSS'] = AutoTokenizer.from_pretrained(self.config.alto_v2_additive_loss_model_path)
+        self.models['ALTO-V2_ADDITIVE_LOSS'] = AutoModelForTokenClassification.from_pretrained(
+            self.config.alto_v2_additive_loss_model_path).eval().to(self.config.device)
+        self.tokenizers['ALTO-V2_ADDITIVE_LOSS+PP'] = self.tokenizers['ALTO-V2_ADDITIVE_LOSS']
+        self.models['ALTO-V2_ADDITIVE_LOSS+PP'] = self.models['ALTO-V2_ADDITIVE_LOSS']
+
         # ALTO-Focal (NEW)
         self.tokenizers['ALTO-Focal'] = AutoTokenizer.from_pretrained(self.config.alto_focal_model_path)
         self.models['ALTO-Focal'] = AutoModelForTokenClassification.from_pretrained(
             self.config.alto_focal_model_path).eval().to(self.config.device)
         self.tokenizers['ALTO-Focal+PP'] = self.tokenizers['ALTO-Focal']
         self.models['ALTO-Focal+PP'] = self.models['ALTO-Focal']
+
+        # ADD THIS SECTION - ALTO 3-Class
+        print("Loading ALTO 3-Class model...")
+        self.tokenizers['ALTO-3Class'] = AutoTokenizer.from_pretrained(self.config.alto_3class_model_path)
+        self.models['ALTO-3Class'] = AutoModelForTokenClassification.from_pretrained(
+            self.config.alto_3class_model_path).eval().to(self.config.device)
+        self.tokenizers['ALTO-3Class+PP'] = self.tokenizers['ALTO-3Class']
+        self.models['ALTO-3Class+PP'] = self.models['ALTO-3Class']
+        print("✓ Loaded ALTO 3-Class model")
 
         self.tokenizers['Simple-4Class'] = AutoTokenizer.from_pretrained(self.config.simple_4class_model_path)
         self.models['Simple-4Class'] = AutoModelForTokenClassification.from_pretrained(
@@ -640,7 +667,25 @@ class ModelManager:
         self.tokenizers['Simple-3Class+PP'] = self.tokenizers['Simple-3Class']
         self.models['Simple-3Class+PP'] = self.models['Simple-3Class']
 
+        # Simple 4-class model
+        print("Loading Simple 4-class model...")
+        self.tokenizers['Simple-4Class'] = AutoTokenizer.from_pretrained(self.config.simple_4class_model_path)
+        self.models['Simple-4Class'] = AutoModelForTokenClassification.from_pretrained(
+            self.config.simple_4class_model_path).eval().to(self.config.device)
+        self.tokenizers['Simple-4Class+PP'] = self.tokenizers['Simple-4Class']
+        self.models['Simple-4Class+PP'] = self.models['Simple-4Class']
+
+        print("Loading mBERT 3-Class Weighted model...")
+        self.tokenizers['mBERT-3Class-Weighted'] = AutoTokenizer.from_pretrained(self.config.mbert_3class_weighted_path)
+        self.models['mBERT-3Class-Weighted'] = AutoModelForTokenClassification.from_pretrained(
+            self.config.mbert_3class_weighted_path).eval().to(self.config.device)
+        self.tokenizers['mBERT-3Class-Weighted+PP'] = self.tokenizers['mBERT-3Class-Weighted']
+        self.models['mBERT-3Class-Weighted+PP'] = self.models['mBERT-3Class-Weighted']
+
+        print("✓ Loaded mBERT 3-Class Weighted model")
+
         print("✓ Loaded Simple 4-class and 3-class models")
+
 
         # CRF (optional)
         try:
@@ -816,6 +861,20 @@ class ModelManager:
                 raw_preds[:len(tokens)],
                 min_tokens_between_switches=self.config.min_tokens_between_switches
             )
+
+        elif model_name == 'ALTO-V2_ADDITIVE_LOSS':
+            preds = process_finetuned_model(
+                tokens, self.tokenizers['ALTO-V2_ADDITIVE_LOSS'], self.models['ALTO-V2_ADDITIVE_LOSS'], self.config.device
+            )
+
+        elif model_name == 'ALTO-V2_ADDITIVE_LOSS+PP':
+            raw_preds = process_finetuned_model(
+                tokens, self.tokenizers['ALTO-V2_ADDITIVE_LOSS'], self.models['ALTO-V2_ADDITIVE_LOSS'], self.config.device
+            )
+            preds = apply_post_processing_rules(
+                raw_preds[:len(tokens)],
+                min_tokens_between_switches=self.config.min_tokens_between_switches
+            )
         elif model_name == 'ALTO-Focal':
             preds = process_finetuned_model(
                 tokens, self.tokenizers['ALTO-Focal'], self.models['ALTO-Focal'], self.config.device
@@ -827,6 +886,27 @@ class ModelManager:
             )
             preds = apply_post_processing_rules(
                 raw_preds[:len(tokens)],
+                min_tokens_between_switches=self.config.min_tokens_between_switches
+            )
+
+        # ADD THIS SECTION - ALTO 3-Class predictions
+        elif model_name == 'ALTO-3Class':
+            # Get 3-class predictions and remap to 4-class
+            raw_preds_3class = process_finetuned_model(
+                tokens, self.tokenizers['ALTO-3Class'],
+                self.models['ALTO-3Class'], self.config.device
+            )
+            preds = remap_3class_to_4class(raw_preds_3class)
+
+        elif model_name == 'ALTO-3Class+PP':
+            # Get 3-class predictions, remap, then apply PP
+            raw_preds_3class = process_finetuned_model(
+                tokens, self.tokenizers['ALTO-3Class'],
+                self.models['ALTO-3Class'], self.config.device
+            )
+            remapped = remap_3class_to_4class(raw_preds_3class)
+            preds = apply_post_processing_rules(
+                remapped[:len(tokens)],
                 min_tokens_between_switches=self.config.min_tokens_between_switches
             )
 
@@ -865,6 +945,26 @@ class ModelManager:
                 remapped[:len(tokens)],
                 min_tokens_between_switches=self.config.min_tokens_between_switches
             )
+        elif model_name == 'mBERT-3Class-Weighted':
+            # Get 3-class predictions and remap to 4-class
+            raw_preds_3class = process_finetuned_model(
+                tokens, self.tokenizers['mBERT-3Class-Weighted'],
+                self.models['mBERT-3Class-Weighted'], self.config.device
+            )
+            preds = remap_3class_to_4class(raw_preds_3class)
+
+        elif model_name == 'mBERT-3Class-Weighted+PP':
+            # Get 3-class predictions, remap, then apply PP
+            raw_preds_3class = process_finetuned_model(
+                tokens, self.tokenizers['mBERT-3Class-Weighted'],
+                self.models['mBERT-3Class-Weighted'], self.config.device
+            )
+            remapped = remap_3class_to_4class(raw_preds_3class)
+            preds = apply_post_processing_rules(
+                remapped[:len(tokens)],
+                min_tokens_between_switches=self.config.min_tokens_between_switches
+            )
+
 
         else:
             raise ValueError(f"Unknown model: {model_name}")
@@ -1236,10 +1336,13 @@ class ComprehensiveReporter:
             ('mBERT', 'mBERT+PP'),
             ('Simple-4Class', 'Simple-4Class+PP'),  # ADD
             ('Simple-3Class', 'Simple-3Class+PP'),  # ADD
+            ('mBERT-3Class-Weighted', 'mBERT-3Class-Weighted+PP'),
             ('XLM-R', 'XLM-R+PP'),
             ('ALTO', 'ALTO+PP'),
             ('ALTO-V2', 'ALTO-V2+PP'),
+            ('ALTO-V2_ADDITIVE_LOSS', 'ALTO-V2_ADDITIVE_LOSS+PP'),
             ('ALTO-Focal', 'ALTO-Focal+PP'),  # ADD THIS LINE
+            ('ALTO-3Class', 'ALTO-3Class+PP'),  # ADD THIS LINE
             ('CINO', 'CINO+PP'),
             ('Tibetan-RoBERTa', 'Tibetan-RoBERTa+PP'),
         ]
