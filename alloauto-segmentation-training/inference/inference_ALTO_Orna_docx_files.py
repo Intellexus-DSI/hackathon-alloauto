@@ -252,6 +252,7 @@ if __name__ == "__main__":
 
     # Your model path
     model_path = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_combined_data_with_allo_and_auto_balanced_22_10/final_model'
+    # model_path = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_combined_data_with_allo_and_auto_balanced_22_10/final_model'
     # model_path = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_combined_data_with_allo_and_auto_22_10/final_model'
     # model_path = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_NO_SEG_REWARD_16_10/final_model'
 
@@ -262,7 +263,8 @@ if __name__ == "__main__":
     # model_path = './alloauto-segmentation-training/fine_tuned_ALTO_models/ALTO_additive_loss_10_10/final_model'
 
     # Output directory for CSV files
-    output_dir = './inference_results_Orna_22_10_MUL_ALTO_with_more_allo_auto_balanced_data_allo_and_auto_texts'
+    output_dir = './inference_results_Orna_32_10_MUL_ALTO_with_more_allo_auto_balanced_data_allo_and_auto_texts'
+    # output_dir = './inference_results_Orna_22_10_MUL_ALTO_with_more_allo_auto_balanced_data_allo_and_auto_texts'
     # output_dir = './inference_results_Orna_22_10_MUL_ALTO_with_more_allo_auto_data'
     # output_dir = './inference_results_Orna_16_10_MUL_ALTO_no_seg_reward'
     # output_dir = './inference_results_Orna_15_10_MUL'
